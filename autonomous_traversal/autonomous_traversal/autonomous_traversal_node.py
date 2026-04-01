@@ -4,11 +4,20 @@ Autonomous traversal node for the Unitree Go2 robot.
 Subscribes to /point_cloud2, /scan, /odom and /map. Publishes /cmd_vel.
 
 State machine:
-  MOVING_FORWARD  -- obstacle detected   -->  TURNING
-  TURNING         -- aligned & clear     -->  MOVING_FORWARD
-  TURNING         -- aligned & blocked   -->  TURNING (next best sector)
-  TURNING         -- all sectors blocked -->  STOPPED
-  STOPPED         -- terminal state      -->  (nothing)
+  MOVING_FORWARD        -- obstacle detected       -->  TURNING
+  TURNING               -- aligned & clear         -->  MOVING_FORWARD
+                                                        (or NAVIGATING_TO_FRONTIER
+                                                         if a nav_goal is active)
+  TURNING               -- aligned & blocked       -->  TURNING (next best sector)
+  TURNING               -- all sectors blocked     -->  NAVIGATING_TO_FRONTIER
+                                                        (if remembered waypoints exist)
+  TURNING               -- all sectors blocked,    -->  STOPPED
+                           no waypoints
+  NAVIGATING_TO_FRONTIER -- obstacle ahead         -->  TURNING (then resumes nav)
+  NAVIGATING_TO_FRONTIER -- arrived at waypoint    -->  MOVING_FORWARD
+                                                        (or next waypoint)
+  NAVIGATING_TO_FRONTIER -- all waypoints gone     -->  STOPPED
+  STOPPED               -- terminal state          -->  (nothing)
 
 Sector-scoring strategy (three-tier, best available used):
 
@@ -33,6 +42,14 @@ Sector-scoring strategy (three-tier, best available used):
               + (1 − exploration_weight) × lidar_score
 
   When no map has arrived yet only the lidar score is used.
+
+Frontier waypoint memory:
+  Every cloud callback clusters the current visible-frontier points into world-
+  frame (x, y) centroids and merges them into a persistent list capped at
+  max_frontier_waypoints.  Waypoints whose map cells are no longer unknown are
+  pruned before each frontier-navigation attempt.  When immediate turning options
+  are exhausted the robot navigates to the nearest surviving waypoint, turning
+  to face it and resuming forward motion once aligned.
 """
 
 import math
@@ -51,9 +68,10 @@ from sensor_msgs.msg import LaserScan, PointCloud2
 
 
 class State(Enum):
-    MOVING_FORWARD = auto()
-    TURNING        = auto()
-    STOPPED        = auto()
+    MOVING_FORWARD         = auto()
+    TURNING                = auto()
+    NAVIGATING_TO_FRONTIER = auto()
+    STOPPED                = auto()
 
 
 class AutonomousTraversalNode(Node):
@@ -61,51 +79,66 @@ class AutonomousTraversalNode(Node):
         super().__init__('autonomous_traversal_node')
 
         # --- parameters ---
-        self.declare_parameter('forward_speed',        0.4)
-        self.declare_parameter('turn_speed',           0.5)
-        self.declare_parameter('obstacle_threshold',   1.0)   # m – trigger a turn
-        self.declare_parameter('free_threshold',       1.5)   # m – minimum clearance to move
-        self.declare_parameter('front_half_angle_deg', 30.0)
-        self.declare_parameter('sector_width_deg',     30.0)
-        self.declare_parameter('align_tolerance_deg',   8.0)
-        self.declare_parameter('exploration_weight',    0.7)  # 0 = lidar-only, 1 = frontier-only
-        self.declare_parameter('ray_length',            4.0)  # m – map raycast length (tier 2)
-        self.declare_parameter('occupied_threshold',   65)    # occupancy value for "occupied"
-        self.declare_parameter('cloud_z_min',          -0.3)  # m – height band for projection
-        self.declare_parameter('cloud_z_max',           1.5)
-        self.declare_parameter('cloud_downsample',      5)    # keep every Nth point
+        self.declare_parameter('forward_speed',          0.4)
+        self.declare_parameter('turn_speed',             0.5)
+        self.declare_parameter('obstacle_threshold',     1.0)   # m – trigger a turn
+        self.declare_parameter('free_threshold',         1.5)   # m – minimum clearance to move
+        self.declare_parameter('front_half_angle_deg',  30.0)
+        self.declare_parameter('sector_width_deg',      30.0)
+        self.declare_parameter('align_tolerance_deg',    8.0)
+        self.declare_parameter('exploration_weight',     0.7)   # 0=lidar-only  1=frontier-only
+        self.declare_parameter('ray_length',             4.0)   # m – map raycast length (tier 2)
+        self.declare_parameter('occupied_threshold',    65)     # occupancy value for "occupied"
+        self.declare_parameter('cloud_z_min',           -0.3)   # m – height band for projection
+        self.declare_parameter('cloud_z_max',            1.5)
+        self.declare_parameter('cloud_downsample',       5)     # keep every Nth point
+        # frontier waypoint memory
+        self.declare_parameter('frontier_goal_radius',     0.8)  # m – arrival threshold
+        self.declare_parameter('frontier_heading_tol_deg', 15.0) # deg – align before driving
+        self.declare_parameter('max_frontier_waypoints',   20)   # cap on stored waypoints
+        self.declare_parameter('min_waypoint_sep',         2.5)  # m – cluster / dedup radius
+        self.declare_parameter('min_frontier_nav_dist',    2.5)  # m – ignore waypoints closer than this
+        self.declare_parameter('max_frontier_bearings',    300)  # subsample cap for sector scoring
+        # topics
         self.declare_parameter('scan_topic',    '/scan')
         self.declare_parameter('odom_topic',    '/odom')
         self.declare_parameter('map_topic',     '/map')
         self.declare_parameter('cloud_topic',   '/point_cloud2')
         self.declare_parameter('cmd_vel_topic', '/cmd_vel')
 
-        self.forward_speed      = self.get_parameter('forward_speed').value
-        self.turn_speed         = self.get_parameter('turn_speed').value
-        self.obstacle_threshold = self.get_parameter('obstacle_threshold').value
-        self.free_threshold     = self.get_parameter('free_threshold').value
-        self.front_half_angle   = math.radians(self.get_parameter('front_half_angle_deg').value)
-        self.sector_width       = math.radians(self.get_parameter('sector_width_deg').value)
-        self.align_tolerance    = math.radians(self.get_parameter('align_tolerance_deg').value)
-        self.exploration_weight = self.get_parameter('exploration_weight').value
-        self.ray_length         = self.get_parameter('ray_length').value
-        self.occupied_threshold = self.get_parameter('occupied_threshold').value
-        self.cloud_z_min        = self.get_parameter('cloud_z_min').value
-        self.cloud_z_max        = self.get_parameter('cloud_z_max').value
-        self.cloud_downsample   = self.get_parameter('cloud_downsample').value
+        self.forward_speed        = self.get_parameter('forward_speed').value
+        self.turn_speed           = self.get_parameter('turn_speed').value
+        self.obstacle_threshold   = self.get_parameter('obstacle_threshold').value
+        self.free_threshold       = self.get_parameter('free_threshold').value
+        self.front_half_angle     = math.radians(self.get_parameter('front_half_angle_deg').value)
+        self.sector_width         = math.radians(self.get_parameter('sector_width_deg').value)
+        self.align_tolerance      = math.radians(self.get_parameter('align_tolerance_deg').value)
+        self.exploration_weight   = self.get_parameter('exploration_weight').value
+        self.ray_length           = self.get_parameter('ray_length').value
+        self.occupied_threshold   = self.get_parameter('occupied_threshold').value
+        self.cloud_z_min          = self.get_parameter('cloud_z_min').value
+        self.cloud_z_max          = self.get_parameter('cloud_z_max').value
+        self.cloud_downsample     = self.get_parameter('cloud_downsample').value
+        self.frontier_goal_radius   = self.get_parameter('frontier_goal_radius').value
+        self.frontier_heading_tol   = math.radians(self.get_parameter('frontier_heading_tol_deg').value)
+        self.max_frontier_waypoints = self.get_parameter('max_frontier_waypoints').value
+        self.min_waypoint_sep       = self.get_parameter('min_waypoint_sep').value
+        self.min_frontier_nav_dist  = self.get_parameter('min_frontier_nav_dist').value
+        self.max_frontier_bearings  = self.get_parameter('max_frontier_bearings').value
 
         # --- state ---
         self.state            = State.MOVING_FORWARD
         self.current_yaw      = 0.0
         self.robot_x          = 0.0
         self.robot_y          = 0.0
-        self.turn_target_yaw: Optional[float] = None
-        self._turn_candidates: List[Tuple[float, float]] = []
+        self.turn_target_yaw: Optional[float]              = None
+        self._turn_candidates: List[Tuple[float, float]]   = []
+        # frontier navigation
+        self.nav_goal:             Optional[Tuple[float, float]] = None
+        self._frontier_waypoints:  List[Tuple[float, float]]    = []
 
         # sensor data
         self.map_data:           Optional[OccupancyGrid] = None
-        # Robot-relative bearing angles (radians) to each visible frontier point.
-        # Refreshed on every point cloud message.
         self._frontier_bearings: np.ndarray = np.empty(0)
 
         # diagnostics
@@ -145,7 +178,8 @@ class AutonomousTraversalNode(Node):
             f'Autonomous traversal started | '
             f'forward={self.forward_speed} m/s  turn={self.turn_speed} rad/s  '
             f'obstacle<{self.obstacle_threshold} m  free>{self.free_threshold} m  '
-            f'exploration_weight={self.exploration_weight}'
+            f'exploration_weight={self.exploration_weight}  '
+            f'max_waypoints={self.max_frontier_waypoints}'
         )
 
     # ------------------------------------------------------------------
@@ -160,12 +194,15 @@ class AutonomousTraversalNode(Node):
         tier = ('frontier+lidar' if len(self._frontier_bearings) > 0 and self.map_data
                 else 'ray+lidar'  if self.map_data
                 else 'lidar-only')
+        nav_str = (f'→({self.nav_goal[0]:.1f},{self.nav_goal[1]:.1f})'
+                   if self.nav_goal else 'none')
         self.get_logger().info(
             f'[diag] state={self.state.name}  '
             f'scan={self._scan_count}  odom={self._odom_count}  '
             f'cloud={self._cloud_count}  map_updates={self._map_count}  '
-            f'map={map_info}  '
-            f'frontiers={self._frontier_count_last}  scoring={tier}'
+            f'map={map_info}  frontiers={self._frontier_count_last}  '
+            f'waypoints={len(self._frontier_waypoints)}  nav_goal={nav_str}  '
+            f'scoring={tier}'
         )
         self._scan_count = self._odom_count = self._map_count = self._cloud_count = 0
 
@@ -188,8 +225,12 @@ class AutonomousTraversalNode(Node):
     def cloud_callback(self, msg: PointCloud2):
         """
         Project the 3-D cloud to 2-D, transform to map frame, then find all
-        points that land on unknown map cells.  Store their robot-relative
-        bearings as self._frontier_bearings for use during sector scoring.
+        points that land on unknown map cells.
+
+        Two outputs:
+          • self._frontier_bearings  – robot-relative angles used for sector scoring
+          • self._frontier_waypoints – persistent world-frame (x,y) list used for
+                                       recovery navigation when immediate options run out
         """
         self._cloud_count += 1
 
@@ -212,9 +253,9 @@ class AutonomousTraversalNode(Node):
             self._frontier_bearings = np.empty(0)
             return
 
-        pts = raw[::self.cloud_downsample]          # downsample
+        pts = raw[::self.cloud_downsample]
 
-        # --- height filter (robot-relative z) ---
+        # --- height filter ---
         pts = pts[(pts[:, 2] >= self.cloud_z_min) & (pts[:, 2] <= self.cloud_z_max)]
         if len(pts) == 0:
             self._frontier_bearings = np.empty(0)
@@ -237,7 +278,7 @@ class AutonomousTraversalNode(Node):
         my = ((map_y - origin_y) / res).astype(np.int32)
 
         in_bounds = (mx >= 0) & (mx < width) & (my >= 0) & (my < height)
-        mx, my = mx[in_bounds], my[in_bounds]
+        mx, my    = mx[in_bounds], my[in_bounds]
         map_x, map_y = map_x[in_bounds], map_y[in_bounds]
 
         if len(mx) == 0:
@@ -245,7 +286,7 @@ class AutonomousTraversalNode(Node):
             return
 
         # --- find points landing on unknown cells ---
-        indices = (my * width + mx).astype(np.int32)
+        indices     = (my * width + mx).astype(np.int32)
         cell_values = np.array(self.map_data.data, dtype=np.int16)[indices]
         frontier_mask = (cell_values == -1)
 
@@ -253,16 +294,37 @@ class AutonomousTraversalNode(Node):
         fy = map_y[frontier_mask]
 
         if len(fx) == 0:
-            self._frontier_bearings = np.empty(0)
+            self._frontier_bearings   = np.empty(0)
             self._frontier_count_last = 0
             return
 
-        # --- compute robot-relative bearings ---
-        world_bearings = np.arctan2(fy - self.robot_y, fx - self.robot_x)
+        # --- distance filter: discard points too close to the robot ---
+        # Nearby unknown cells are about to be mapped as the robot drives through
+        # them; including them floods the bearing array and generates useless
+        # waypoints right next to the robot.
+        dists = np.hypot(fx - self.robot_x, fy - self.robot_y)
+        far_mask = dists >= self.min_frontier_nav_dist
+        fx_far, fy_far = fx[far_mask], fy[far_mask]
+
+        if len(fx_far) == 0:
+            self._frontier_bearings   = np.empty(0)
+            self._frontier_count_last = 0
+            return
+
+        # --- robot-relative bearings (for live sector scoring) ---
+        world_bearings = np.arctan2(fy_far - self.robot_y, fx_far - self.robot_x)
         rel_bearings   = (world_bearings - self.current_yaw + math.pi) % (2 * math.pi) - math.pi
 
+        # Subsample if still very large so sector scoring stays fast
+        if len(rel_bearings) > self.max_frontier_bearings:
+            step = len(rel_bearings) // self.max_frontier_bearings
+            rel_bearings = rel_bearings[::step]
+
         self._frontier_bearings   = rel_bearings
-        self._frontier_count_last = len(rel_bearings)
+        self._frontier_count_last = len(fx_far)
+
+        # --- merge into persistent waypoint memory ---
+        self._add_frontier_waypoints(fx_far, fy_far)
 
     def scan_callback(self, msg: LaserScan):
         self._scan_count += 1
@@ -284,17 +346,175 @@ class AutonomousTraversalNode(Node):
 
             if abs(yaw_err) <= self.align_tolerance:
                 if front_min is not None and front_min >= self.free_threshold:
-                    self.get_logger().info(
-                        f'Clear path at {math.degrees(self.turn_target_yaw):.1f}° world. '
-                        f'Moving forward.'
-                    )
-                    self.state = State.MOVING_FORWARD
                     self.turn_target_yaw = None
-                    self._publish_forward()
+                    # Resume frontier navigation if one was active, otherwise free-roam
+                    if self.nav_goal is not None:
+                        self.get_logger().info(
+                            'Clear path after turn. Resuming frontier navigation.'
+                        )
+                        self.state = State.NAVIGATING_TO_FRONTIER
+                    else:
+                        self.get_logger().info('Clear path. Moving forward.')
+                        self.state = State.MOVING_FORWARD
+                        self._publish_forward()
                 else:
                     self._try_next_candidate()
             else:
                 self._publish_turn(1.0 if yaw_err > 0 else -1.0)
+
+        elif self.state == State.NAVIGATING_TO_FRONTIER:
+            self._navigate_to_frontier(msg, front_min)
+
+    # ------------------------------------------------------------------
+    # Frontier navigation
+    # ------------------------------------------------------------------
+    def _navigate_to_frontier(self, msg: LaserScan, front_min: Optional[float]):
+        """Drive toward self.nav_goal, handling obstacles and arrival."""
+        if self.nav_goal is None:
+            self._start_frontier_nav()
+            return
+
+        goal_x, goal_y = self.nav_goal
+        dist = math.hypot(goal_x - self.robot_x, goal_y - self.robot_y)
+
+        # --- arrived ---
+        if dist < self.frontier_goal_radius:
+            self.get_logger().info(
+                f'Arrived at frontier waypoint ({goal_x:.2f}, {goal_y:.2f}). '
+                f'{len(self._frontier_waypoints) - 1} waypoint(s) remaining.'
+            )
+            self._frontier_waypoints = [
+                w for w in self._frontier_waypoints
+                if math.hypot(w[0] - goal_x, w[1] - goal_y) > self.frontier_goal_radius
+            ]
+            self.nav_goal = None
+            # Try the next waypoint; if none left, resume free-roam
+            if self._frontier_waypoints:
+                self._start_frontier_nav()
+            else:
+                self.get_logger().info('All frontier waypoints reached. Resuming free-roam.')
+                self.state = State.MOVING_FORWARD
+                self._publish_forward()
+            return
+
+        # --- obstacle en route: hand off to turn logic ---
+        if front_min is not None and front_min < self.obstacle_threshold:
+            self.get_logger().info(
+                f'Obstacle during frontier nav to ({goal_x:.2f}, {goal_y:.2f}). Turning.'
+            )
+            # nav_goal stays set so TURNING knows to resume nav afterwards
+            self._start_turn(msg)
+            return
+
+        # --- steer toward goal ---
+        goal_bearing = math.atan2(goal_y - self.robot_y, goal_x - self.robot_x)
+        heading_err  = self._angle_diff(goal_bearing, self.current_yaw)
+
+        if abs(heading_err) > self.frontier_heading_tol:
+            self._publish_turn(1.0 if heading_err > 0 else -1.0)
+        else:
+            self._publish_forward()
+
+    def _start_frontier_nav(self):
+        """Prune mapped waypoints, pick the nearest surviving one, begin nav."""
+        self._prune_frontier_waypoints()
+
+        # Drop any waypoints that are now too close (the robot has moved near them
+        # since they were first recorded)
+        reachable = [
+            w for w in self._frontier_waypoints
+            if math.hypot(w[0] - self.robot_x, w[1] - self.robot_y) >= self.min_frontier_nav_dist
+        ]
+        discarded = len(self._frontier_waypoints) - len(reachable)
+        if discarded:
+            self.get_logger().info(
+                f'Discarded {discarded} waypoint(s) now within {self.min_frontier_nav_dist:.1f} m.'
+            )
+        self._frontier_waypoints = reachable
+
+        if not self._frontier_waypoints:
+            self.get_logger().info('No distant frontier waypoints available. Stopping.')
+            self.state = State.STOPPED
+            self._publish_stop()
+            return
+
+        # Pick the nearest waypoint that still meets the distance requirement
+        best = min(
+            self._frontier_waypoints,
+            key=lambda w: math.hypot(w[0] - self.robot_x, w[1] - self.robot_y),
+        )
+        dist = math.hypot(best[0] - self.robot_x, best[1] - self.robot_y)
+
+        self.nav_goal = best
+        self.state    = State.NAVIGATING_TO_FRONTIER
+        self.get_logger().info(
+            f'Navigating to frontier waypoint ({best[0]:.2f}, {best[1]:.2f})  '
+            f'dist={dist:.2f} m  ({len(self._frontier_waypoints)} waypoint(s) in memory)'
+        )
+
+    def _add_frontier_waypoints(self, fx: np.ndarray, fy: np.ndarray):
+        """
+        Cluster new frontier points onto a grid and merge centroids that are
+        far enough from existing waypoints into the persistent list.
+        """
+        sep = self.min_waypoint_sep
+
+        # Snap to grid → collect points per cell
+        grid: dict = {}
+        for x, y in zip(fx.tolist(), fy.tolist()):
+            key = (round(x / sep), round(y / sep))
+            if key not in grid:
+                grid[key] = []
+            grid[key].append((x, y))
+
+        added = 0
+        for pts in grid.values():
+            if len(self._frontier_waypoints) >= self.max_frontier_waypoints:
+                break
+            cx = sum(p[0] for p in pts) / len(pts)
+            cy = sum(p[1] for p in pts) / len(pts)
+            too_close = any(
+                math.hypot(cx - wx, cy - wy) < sep
+                for wx, wy in self._frontier_waypoints
+            )
+            if not too_close:
+                self._frontier_waypoints.append((cx, cy))
+                added += 1
+
+        if added > 0:
+            self.get_logger().debug(
+                f'Added {added} frontier waypoint(s). Total: {len(self._frontier_waypoints)}'
+            )
+
+    def _prune_frontier_waypoints(self):
+        """Remove waypoints whose map cells are no longer unknown."""
+        if self.map_data is None:
+            return
+
+        res      = self.map_data.info.resolution
+        origin_x = self.map_data.info.origin.position.x
+        origin_y = self.map_data.info.origin.position.y
+        width    = self.map_data.info.width
+        height   = self.map_data.info.height
+        data     = self.map_data.data
+
+        surviving = []
+        for wx, wy in self._frontier_waypoints:
+            mx = int((wx - origin_x) / res)
+            my = int((wy - origin_y) / res)
+            if not (0 <= mx < width and 0 <= my < height):
+                surviving.append((wx, wy))   # outside map bounds → still unknown
+                continue
+            if data[my * width + mx] == -1:
+                surviving.append((wx, wy))   # still unknown → keep
+
+        removed = len(self._frontier_waypoints) - len(surviving)
+        if removed > 0:
+            self.get_logger().info(
+                f'Pruned {removed} mapped frontier waypoint(s). '
+                f'{len(surviving)} remaining.'
+            )
+        self._frontier_waypoints = surviving
 
     # ------------------------------------------------------------------
     # Turn management
@@ -307,20 +527,15 @@ class AutonomousTraversalNode(Node):
             self._publish_stop()
             return
 
-        # Determine which flank has more immediate free space and put those
-        # candidates first so the robot turns away from the obstacle rather
-        # than into it.  Exploration scoring is preserved within each group.
+        # Prefer the side with more immediate clearance so the robot turns
+        # away from the obstacle rather than into it.
         left_clear, right_clear = self._side_clearance(msg)
-        clearance_diff = left_clear - right_clear          # + = left clearer
-        preferred_sign = 1.0 if clearance_diff >= 0 else -1.0   # CCW (+) or CW (-)
+        preferred_sign = 1.0 if left_clear >= right_clear else -1.0
 
         preferred, fallback = [], []
         for score, world_yaw in candidates:
             yaw_err = self._angle_diff(world_yaw, self.current_yaw)
-            if yaw_err * preferred_sign >= 0:
-                preferred.append((score, world_yaw))
-            else:
-                fallback.append((score, world_yaw))
+            (preferred if yaw_err * preferred_sign >= 0 else fallback).append((score, world_yaw))
 
         self._turn_candidates = preferred + fallback
 
@@ -328,8 +543,8 @@ class AutonomousTraversalNode(Node):
         tier = ('frontier+lidar' if n_frontiers > 0 and self.map_data
                 else 'ray+lidar'  if self.map_data
                 else 'lidar-only')
-        side_str = f'left={left_clear:.2f} m  right={right_clear:.2f} m  ' \
-                   f'→ prefer {"left(CCW)" if preferred_sign > 0 else "right(CW)"}'
+        side_str = (f'left={left_clear:.2f} m  right={right_clear:.2f} m  '
+                    f'→ prefer {"left(CCW)" if preferred_sign > 0 else "right(CW)"}')
         self.get_logger().info(
             f'Obstacle (<{self.obstacle_threshold} m). '
             f'{len(candidates)} candidate(s) [{tier}, {n_frontiers} frontier pts] | '
@@ -339,9 +554,22 @@ class AutonomousTraversalNode(Node):
 
     def _try_next_candidate(self):
         if not self._turn_candidates:
-            self.get_logger().info('All candidates exhausted. Stopping.')
-            self.state = State.STOPPED
-            self._publish_stop()
+            # All immediate options exhausted — fall back to remembered frontiers
+            self._prune_frontier_waypoints()
+            if self._frontier_waypoints:
+                self.get_logger().info(
+                    f'Immediate candidates exhausted. '
+                    f'Falling back to {len(self._frontier_waypoints)} remembered '
+                    f'frontier waypoint(s).'
+                )
+                self.nav_goal = None        # _start_frontier_nav will assign it
+                self._start_frontier_nav()
+            else:
+                self.get_logger().info(
+                    'All candidates and frontier waypoints exhausted. Stopping.'
+                )
+                self.state = State.STOPPED
+                self._publish_stop()
             return
 
         score, world_yaw = self._turn_candidates.pop(0)
@@ -353,7 +581,7 @@ class AutonomousTraversalNode(Node):
         self.get_logger().info(
             f'Turning {turn_dir} → {math.degrees(world_yaw):.1f}° '
             f'(score={score:.3f}, Δyaw={math.degrees(yaw_err):.1f}°, '
-            f'{len(self._turn_candidates)} alt(s) left).'
+            f'{len(self._turn_candidates)} alt(s) left)'
         )
         self._publish_turn(1.0 if yaw_err > 0 else -1.0)
 
@@ -362,12 +590,8 @@ class AutonomousTraversalNode(Node):
     # ------------------------------------------------------------------
     def _rank_sectors(self, msg: LaserScan) -> List[Tuple[float, float]]:
         """
-        Score every non-rear sector and return them sorted best-first.
-
-        Exploration score source (best available):
-          • Tier 1: visible-frontier fraction from point cloud + map
-          • Tier 2: unknown-cell fraction from map raycast
-          • Tier 3: no map — exploration score = 0, only lidar score used
+        Score every non-rear sector and return them sorted best-first as
+        (score, world_yaw) pairs.
         """
         has_frontiers = len(self._frontier_bearings) > 0 and self.map_data is not None
         has_map       = self.map_data is not None
@@ -380,8 +604,7 @@ class AutonomousTraversalNode(Node):
             hi  = lo + self.sector_width
             mid = (lo + hi) / 2.0
 
-            # Exclude rear arc to discourage back-tracking
-            if abs(mid) > math.radians(135.0):
+            if abs(mid) > math.radians(135.0):   # exclude rear arc
                 continue
 
             ranges_in_sector = [
@@ -411,11 +634,7 @@ class AutonomousTraversalNode(Node):
         return results
 
     def _frontier_sector_score(self, sector_lo: float, sector_hi: float) -> float:
-        """
-        Fraction of all visible-frontier bearings that fall within the given
-        robot-relative angular sector [sector_lo, sector_hi).
-        Returns a value in [0, 1]; higher means more uncharted space in that direction.
-        """
+        """Fraction of visible-frontier bearings inside [sector_lo, sector_hi)."""
         if len(self._frontier_bearings) == 0:
             return 0.0
         in_sector = np.sum(
@@ -424,10 +643,7 @@ class AutonomousTraversalNode(Node):
         return float(in_sector) / len(self._frontier_bearings)
 
     def _ray_exploration_score(self, world_angle: float) -> float:
-        """
-        Tier-2 fallback: cast a ray through the map and return the fraction of
-        cells that are unknown.  Stops at occupied cells.
-        """
+        """Tier-2: fraction of ray cells that are unknown, stopping at occupied cells."""
         if self.map_data is None:
             return 0.0
 
@@ -438,11 +654,11 @@ class AutonomousTraversalNode(Node):
         height   = self.map_data.info.height
         data     = self.map_data.data
 
-        n_steps  = max(1, int(self.ray_length / res))
-        cos_a    = math.cos(world_angle)
-        sin_a    = math.sin(world_angle)
-        unknown  = 0
-        total    = 0
+        n_steps = max(1, int(self.ray_length / res))
+        cos_a   = math.cos(world_angle)
+        sin_a   = math.sin(world_angle)
+        unknown = 0
+        total   = 0
 
         for k in range(1, n_steps + 1):
             d  = k * res
@@ -467,9 +683,9 @@ class AutonomousTraversalNode(Node):
     # ------------------------------------------------------------------
     def _side_clearance(self, msg: LaserScan) -> Tuple[float, float]:
         """
-        Return (left_mean, right_mean) average range in the side flanks,
-        using the 20°–100° band on each side.  The front cone is excluded
-        so an obstacle directly ahead doesn't bias the comparison.
+        Mean range in the 20°–100° flank on each side (front cone excluded so
+        the blocked obstacle doesn't bias the comparison).
+        Returns (left_mean, right_mean) in metres.
         """
         left_lo,  left_hi  =  math.radians(20),  math.radians(100)
         right_lo, right_hi = -math.radians(100), -math.radians(20)
