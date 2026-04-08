@@ -9,6 +9,7 @@ Bounding Boxes use image convention, ie center.y = 0 means top of image.
 import collections
 import numpy as np
 import rclpy
+from rclpy.qos import QoSProfile, ReliabilityPolicy
 from rclpy.node import Node
 from sensor_msgs.msg import Image
 from vision_msgs.msg import BoundingBox2D, ObjectHypothesis, ObjectHypothesisWithPose
@@ -40,7 +41,7 @@ class CocoDetectorNode(Node):
             Image,
             "/camera/image_raw",
             self.listener_callback,
-            10)
+            QoSProfile(depth=10, reliability=ReliabilityPolicy.BEST_EFFORT))
         self.detected_objects_publisher = \
             self.create_publisher(Detection2DArray, "detected_objects", 10)
         if self.get_parameter('publish_annotated_image').get_parameter_value().bool_value:
