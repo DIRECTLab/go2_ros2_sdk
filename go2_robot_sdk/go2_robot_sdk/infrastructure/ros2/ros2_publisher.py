@@ -99,6 +99,15 @@ class ROS2Publisher(IRobotDataPublisher):
         odom_msg.pose.pose.orientation.z = float(orientation['z'])
         odom_msg.pose.pose.orientation.w = float(orientation['w'])
 
+        # Diagonal pose covariance [x, y, z, roll, pitch, yaw]
+        # Row-major 6x6 matrix; indices 0,7,14,21,28,35 are the diagonal
+        odom_msg.pose.covariance[0]  = 0.01   # x
+        odom_msg.pose.covariance[7]  = 0.01   # y
+        odom_msg.pose.covariance[14] = 0.01   # z
+        odom_msg.pose.covariance[21] = 0.001  # roll  (IMU-stabilized)
+        odom_msg.pose.covariance[28] = 0.001  # pitch (IMU-stabilized)
+        odom_msg.pose.covariance[35] = 0.05   # yaw   (most drift on legged robots)
+
         self.publishers['odometry'][robot_idx].publish(odom_msg)
 
     def publish_joint_state(self, robot_data: RobotData) -> None:
