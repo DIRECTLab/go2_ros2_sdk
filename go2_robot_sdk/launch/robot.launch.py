@@ -7,8 +7,8 @@ from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
 from launch.conditions import IfCondition
 from launch.substitutions import LaunchConfiguration
-from launch_ros.actions import Node
-from launch.actions import IncludeLaunchDescription, DeclareLaunchArgument
+from launch_ros.actions import Node, PushRosNamespace
+from launch.actions import GroupAction, IncludeLaunchDescription, DeclareLaunchArgument
 from launch.launch_description_sources import FrontendLaunchDescriptionSource, PythonLaunchDescriptionSource
 
 
@@ -96,7 +96,7 @@ class Go2NodeFactory:
         if self.config.conn_mode == 'single':
             # Single robot configuration
             robot_desc = self._load_urdf_content(self.config.config_paths['urdf'])
-            
+
             nodes.extend([
                 Node(
                     package='robot_state_publisher',
@@ -284,7 +284,7 @@ class Go2NodeFactory:
             ),
         ]
     
-    def create_include_launches(self) -> List[IncludeLaunchDescription]:
+    def create_include_launches(self) -> List[IncludeLaunchDescription | Node]:
         """Create included launch descriptions"""
         use_sim_time = LaunchConfiguration('use_sim_time', default='false')
         with_foxglove = LaunchConfiguration('foxglove', default='true')
@@ -302,17 +302,19 @@ class Go2NodeFactory:
                 FrontendLaunchDescriptionSource(foxglove_launch),
                 condition=IfCondition(with_foxglove),
             ),
-            # SLAM Toolbox
-            IncludeLaunchDescription(
-                PythonLaunchDescriptionSource([
-                    os.path.join(get_package_share_directory('slam_toolbox'),
-                                'launch', 'online_async_launch.py')
-                ]),
+            # SLAM Toolbox (direct Node so remappings take effect)
+            Node(
+                package='slam_toolbox',
+                executable='async_slam_toolbox_node',
+                name='slam_toolbox',
+                output='screen',
                 condition=IfCondition(with_slam),
-                launch_arguments={
-                    'slam_params_file': self.config.config_paths['slam'],
-                    'use_sim_time': use_sim_time,
-                }.items(),
+                parameters=[self.config.config_paths['slam'], {'use_sim_time': use_sim_time}],
+                remappings=[
+                    ('/scan', '/go2/scan'),
+                    ('/map', '/go2/map'),
+                    ('/map_updates', '/go2/map_updates'),
+                ],
             ),
             # Nav2
             IncludeLaunchDescription(
@@ -323,7 +325,7 @@ class Go2NodeFactory:
                 condition=IfCondition(with_nav2),
                 launch_arguments={
                     'params_file': self.config.config_paths['nav2'],
-                    'use_sim_time': use_sim_time,
+                    'use_sim_time': use_sim_time
                 }.items(),
             ),
         ]
@@ -344,6 +346,7 @@ def generate_launch_description():
     visualization_nodes = factory.create_visualization_nodes()
     include_launches = factory.create_include_launches()
     
+
     # Combine all elements
     launch_entities = (
         launch_args +
@@ -353,5 +356,8 @@ def generate_launch_description():
         visualization_nodes +
         include_launches
     )
+    group = GroupAction([PushRosNamespace('go2'), *launch_entities])
+    ld = LaunchDescription()    
+    ld.add_action(group)
+    return ld
     
-    return LaunchDescription(launch_entities)

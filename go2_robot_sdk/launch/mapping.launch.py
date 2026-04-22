@@ -51,9 +51,9 @@ def generate_launch_description():
     with_joystick = LaunchConfiguration('joystick', default='true')
     
     launch_args = [
-        DeclareLaunchArgument('rviz', default_value='true', description='Launch RViz2'),
-        DeclareLaunchArgument('foxglove', default_value='true', description='Launch Foxglove Bridge'),
-        DeclareLaunchArgument('joystick', default_value='true', description='Launch joystick control'),
+        DeclareLaunchArgument('rviz', default_value='false', description='Launch RViz2'),
+        DeclareLaunchArgument('foxglove', default_value='false', description='Launch Foxglove Bridge'),
+        DeclareLaunchArgument('joystick', default_value='false', description='Launch joystick control'),
     ]
     
     # Load URDF
@@ -120,7 +120,7 @@ def generate_launch_description():
             name='go2_pointcloud_to_laserscan',
             remappings=[
                 ('cloud_in', '/pointcloud/filtered'),
-                ('scan', '/scan'),
+                ('scan', '/go2/scan'),
             ],
             parameters=[{
                 'target_frame': 'base_link',
@@ -128,7 +128,7 @@ def generate_launch_description():
                 'min_height': -1.0,
                 'angle_min': -3.14159,
                 'angle_max': 3.14159,
-                'angle_increment': 0.00872665,
+                'angle_increment': 0.01745329,
                 'scan_time': 0.1,
                 'range_min': 0.3,
                 'range_max': 20.0,
@@ -206,15 +206,13 @@ def generate_launch_description():
             condition=IfCondition(with_foxglove),
         ),
         # SLAM Toolbox for mapping
-        IncludeLaunchDescription(
-            PythonLaunchDescriptionSource([
-                os.path.join(get_package_share_directory('slam_toolbox'),
-                            'launch', 'online_async_launch.py')
-            ]),
-            launch_arguments={
-                'slam_params_file': config_paths['slam'],
-                'use_sim_time': use_sim_time,
-            }.items(),
+        Node(
+            package='slam_toolbox',
+            executable='async_slam_toolbox_node',
+            name='slam_toolbox',
+            output='screen',
+            parameters=[config_paths['slam'], {'use_sim_time': use_sim_time}],
+            remappings=[('map', '/go2/map'), ('map_updates', '/go2/map_updates')],
         ),
     ]
     
