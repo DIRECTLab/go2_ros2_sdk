@@ -39,14 +39,14 @@ class CocoDetectorNode(Node):
             self.get_parameter('detection_threshold').get_parameter_value().double_value
         self.subscription = self.create_subscription(
             Image,
-            "/camera/image_raw",
+            "/go2/camera/image_raw",
             self.listener_callback,
             QoSProfile(depth=10, reliability=ReliabilityPolicy.BEST_EFFORT))
         self.detected_objects_publisher = \
-            self.create_publisher(Detection2DArray, "detected_objects", 10)
+            self.create_publisher(Detection2DArray, "go2/detected_objects", 10)
         if self.get_parameter('publish_annotated_image').get_parameter_value().bool_value:
             self.annotated_image_publisher = \
-                self.create_publisher(Image, "annotated_image", 10)
+                self.create_publisher(Image, "go2/annotated_image", 10)
         else:
             self.annotated_image_publisher = None
         self.bridge = CvBridge()

@@ -1,0 +1,35 @@
+rtabmap:
+  ros__parameters:
+    # Input mode: lidar scan only (no RGB-D)
+    subscribe_scan: true
+    subscribe_depth: false
+    subscribe_rgbd: false
+    subscribe_stereo: false
+
+    # Frames
+    frame_id: base_link
+    odom_frame_id: odom
+    map_frame_id: map
+
+    # Sync
+    approx_sync: true
+    topic_queue_size: 30
+    sync_queue_size: 30
+
+    # Map update
+    Rtabmap/DetectionRate: "1.0"
+    Rtabmap/TimeThr: "0"
+
+    # 2D lidar SLAM settings
+    Reg/Strategy: "1"          # 1 = ICP
+    Icp/PointToPlane: "false"
+    Icp/Iterations: "30"
+    Icp/MaxCorrespondenceDistance: "0.1"
+    Icp/VoxelSize: "0.05"
+    Grid/FromDepth: "false"    # build occupancy from laser scan
+    Grid/RayTracing: "true"
+    Grid/CellSize: "0.05"
+
+    # Loop closure
+    Mem/STMSize: "30"
+    Kp/MaxFeatures: "400"
