@@ -6,6 +6,49 @@ import logging
 import os
 from typing import Dict, Any
 
+
+try:
+    from go2_robot_sdk.jetson_h264_patch import JetsonH264Decoder
+    import aiortc.codecs.h264 as _h264_mod
+    import aiortc.codecs as _codecs_mod
+    import aiortc.rtcrtpreceiver as _receiver_mod
+
+    # patch the decoder class
+    _h264_mod.H264Decoder = JetsonH264Decoder
+    _codecs_mod.H264Decoder = JetsonH264Decoder
+
+    # patch decoder_worker to wire up async output
+    _original_get_decoder = _codecs_mod.get_decoder
+    def _patched_get_decoder(codec):
+        dec = _original_get_decoder(codec)
+        return dec
+    
+    _original_worker = _receiver_mod.decoder_worker
+    def _patched_worker(loop, input_q, output_q):
+        codec_name = None
+        decoder = None
+        while True:
+            task = input_q.get()
+            if task is None:
+                asyncio.run_coroutine_threadsafe(output_q.put(None), loop)
+                break
+            codec, encoded_frame = task
+            if codec.name != codec_name:
+                decoder = _codecs_mod.get_decoder(codec)
+                codec_name = codec.name
+                # wire up async output if it's our decoder
+                if isinstance(decoder, JetsonH264Decoder):
+                    decoder.set_output(loop, output_q)
+            decoder.decode(encoded_frame)  # returns [] always, frames pushed async
+        if decoder is not None:
+            del decoder
+
+    _receiver_mod.decoder_worker = _patched_worker
+    logging.getLogger(__name__).warning("[JETSON PATCH] Async hardware H264 decoder active")
+except Exception as e:
+    logging.getLogger(__name__).warning(f"[JETSON PATCH] Failed: {e}")
+
+
 from aiortc import MediaStreamTrack
 from cv_bridge import CvBridge
 
