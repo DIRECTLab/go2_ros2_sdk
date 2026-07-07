@@ -10,6 +10,7 @@ class RobotConfig:
     """Robot configuration parameters"""
     robot_ip_list: List[str]
     token: str
+    aes_key: str
     conn_type: str
     enable_video: bool
     decode_lidar: bool
@@ -20,7 +21,8 @@ class RobotConfig:
     @classmethod
     def from_params(cls, robot_ip: str, token: str, conn_type: str, 
                    enable_video: bool, decode_lidar: bool, 
-                   publish_raw_voxel: bool, obstacle_avoidance: bool):
+                   publish_raw_voxel: bool, obstacle_avoidance: bool,
+                   aes_key: str = ""):
         """Создание конфигурации из параметров"""
         robot_ip_list = robot_ip.replace(" ", "").split(",")
         conn_mode = "single" if (
@@ -29,6 +31,7 @@ class RobotConfig:
         return cls(
             robot_ip_list=robot_ip_list,
             token=token,
+            aes_key=aes_key,
             conn_type=conn_type,
             enable_video=enable_video,
             decode_lidar=decode_lidar,

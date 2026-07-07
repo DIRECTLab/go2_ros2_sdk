@@ -122,6 +122,33 @@ export CONN_TYPE="webrtc"
 ros2 launch go2_robot_sdk robot.launch.py
 ```
 
+### Go2 firmware >= 1.1.15 (WebRTC local connection)
+
+Starting with Go2 firmware **1.1.15**, the robot wraps its RSA public key in the LAN handshake (`con_notify`) with a **per-device AES-128 key** (`data2 == 3`) instead of the older static key (`data2 == 2`). If you're on this firmware or newer and see:
+
+```
+Failed to complete encrypted handshake: Failed to load RSA public key: RSA key format is not supported
+```
+
+...you need to supply your robot's per-device AES-128 key via the `aes_key` parameter (or `ROBOT_AES_KEY` / `GO2_AES_KEY` environment variable):
+
+```shell
+export ROBOT_IP="robot_ip"
+export ROBOT_AES_KEY="32_hex_character_key"
+export CONN_TYPE="webrtc"
+ros2 launch go2_robot_sdk robot.launch.py
+```
+
+You can fetch this key with your Unitree account credentials using [`unitree_webrtc_connect`](https://github.com/legion1581/unitree_webrtc_connect)'s `fetch_aes_key.py` example or the `unitree-fetch-aes-key` CLI:
+
+```shell
+pip install unitree_webrtc_connect
+unitree-fetch-aes-key --email your@email.com --password 'yourpassword' --device-type Go2
+```
+
+This prints the AES-128 key (32 hex characters) for each robot registered to your account, keyed by serial number. If your robot is still on older firmware (`data2 == 2` or unencrypted), `aes_key` can be left unset.
+
+
 The `robot.launch.py` code starts many services/nodes simultaneously, including 
 
 * robot_state_publisher

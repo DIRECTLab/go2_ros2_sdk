@@ -44,6 +44,7 @@ class WebRTCAdapter(IRobotDataReceiver, IRobotController):
                 robot_ip=robot_ip,
                 robot_num=robot_id,
                 token=self.config.token,
+                aes_key=self.config.aes_key,
                 on_validated=self._on_validated,
                 on_message=self._on_data_channel_message,
                 on_video_frame=self.on_video_frame_callback if self.config.enable_video else None,
