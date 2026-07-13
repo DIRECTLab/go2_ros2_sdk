@@ -37,6 +37,7 @@ class Go2Connection:
         robot_ip: str,
         robot_num: int,
         token: str = "",
+        aes_key: str = "",
         on_validated: Optional[Callable] = None,
         on_message: Optional[Callable] = None,
         on_open: Optional[Callable] = None,
@@ -47,6 +48,7 @@ class Go2Connection:
         self.robot_ip = robot_ip
         self.robot_num = str(robot_num)
         self.token = token
+        self.aes_key = aes_key
         self.robot_validation = "PENDING"
         self.validation_result = "PENDING"
         
@@ -221,7 +223,38 @@ class Go2Connection:
         aesgcm = AESGCM(key) 
         plaintext = aesgcm.decrypt(nonce, ciphertext + tag, None)
         return plaintext.decode('utf-8')
-	 
+
+    #decrypt RSA key from firmware version >=1.1.15 (data2=3), wrapped with a
+    #per-device AES-128 key fetched from the Unitree cloud account
+    def decrypt_con_notify_data_v3(self, encrypted_b64: str) -> str:
+        if not self.aes_key:
+            raise EncryptionError(
+                "Robot requires a per-device AES-128 key (data2=3, firmware "
+                ">=1.1.15) but none was provided. Set the 'aes_key' robot "
+                "config parameter (32 hex chars)."
+            )
+        try:
+            key = bytes.fromhex(self.aes_key.strip().lower())
+        except ValueError as e:
+            raise EncryptionError(f"aes_key is not valid hex: {e}")
+        if len(key) != 16:
+            raise EncryptionError(
+                f"aes_key must be 16 bytes (32 hex chars), got {len(key)} bytes"
+            )
+
+        data = base64.b64decode(encrypted_b64)
+        if len(data) < 28:
+            raise ValueError("Decryption failed: input data too short")
+        tag = data[-16:]
+        nonce = data[-28:-16]
+        ciphertext = data[:-28]
+
+        aesgcm = AESGCM(key)
+        try:
+            plaintext = aesgcm.decrypt(nonce, ciphertext + tag, None)
+        except Exception as e:
+            raise EncryptionError(f"aes_key rejected by robot: {e}")
+        return plaintext.decode('utf-8')
 
     async def connect(self) -> None:
         """Establish WebRTC connection to robot with full encryption"""
@@ -260,6 +293,8 @@ class Go2Connection:
 
                 if data2 == 2:
                     data1 = self.decrypt_con_notify_data(data1)
+                elif data2 == 3:
+                    data1 = self.decrypt_con_notify_data_v3(data1)
                 # Extract the public key from 'data1'
                 public_key_pem = data1[10:len(data1)-10]
                 path_ending = PathCalculator.calc_local_path_ending(data1)
