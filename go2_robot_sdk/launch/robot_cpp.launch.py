@@ -1,20 +1,76 @@
 # Robot launch file with C++ lidar processing nodes
 
 import os
+import tempfile
 from typing import List
+import yaml
 from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
 from launch.conditions import IfCondition
 from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
-from launch.actions import IncludeLaunchDescription, DeclareLaunchArgument
+from launch.actions import IncludeLaunchDescription, DeclareLaunchArgument, OpaqueFunction
 from launch.launch_description_sources import FrontendLaunchDescriptionSource, PythonLaunchDescriptionSource
+
+
+# Parameter keys whose value names a TF frame, across the nav2 and slam_toolbox
+# yaml files this stack loads.
+_FRAME_PARAM_KEYS = frozenset({
+    'base_frame', 'map_frame', 'odom_frame',
+    'base_frame_id', 'global_frame_id', 'odom_frame_id',
+    'global_frame', 'robot_base_frame', 'target_frame',
+})
+
+
+def prefix_frame(tf_prefix: str, frame: str) -> str:
+    """Namespace a frame id: '' -> 'base_link', 'go2' -> 'go2/base_link'."""
+    return f'{tf_prefix}/{frame}' if tf_prefix else frame
+
+
+def rewrite_frame_params(params_path: str, tf_prefix: str) -> str:
+    """Copy a params yaml with every TF frame value prefixed, return the new path.
+
+    Returns params_path untouched when tf_prefix is empty. A flat key->value
+    substitution would be wrong here: nav2 reuses 'global_frame' under several
+    nodes with different values ('map' for the global costmap, 'odom' for the
+    local one), so each value is prefixed in place instead.
+    """
+    if not tf_prefix:
+        return params_path
+
+    with open(params_path, 'r') as handle:
+        data = yaml.safe_load(handle)
+
+    def walk(node):
+        if isinstance(node, dict):
+            for key, value in node.items():
+                if key in _FRAME_PARAM_KEYS and isinstance(value, str) and value:
+                    node[key] = prefix_frame(tf_prefix, value)
+                else:
+                    walk(value)
+        elif isinstance(node, list):
+            for item in node:
+                walk(item)
+
+    walk(data)
+
+    rewritten = tempfile.NamedTemporaryFile(
+        mode='w', prefix='go2_frames_', suffix='.yaml', delete=False)
+    yaml.safe_dump(data, rewritten, default_flow_style=False)
+    rewritten.close()
+    return rewritten.name
 
 
 class Go2LaunchConfig:
     """Configuration container for Go2 robot launch parameters"""
-    
-    def __init__(self):
+
+    def __init__(self, tf_prefix: str = ''):
+        # TF namespacing
+        self.tf_prefix = tf_prefix.strip().strip('/')
+        # robot_state_publisher prepends frame_prefix verbatim, so it needs the
+        # trailing separator: '' -> '', 'go2' -> 'go2/'
+        self.frame_prefix = f'{self.tf_prefix}/' if self.tf_prefix else ''
+
         # Environment variables
         self.robot_token = os.getenv('ROBOT_TOKEN', '')
         self.robot_ip = os.getenv('ROBOT_IP', '')
@@ -37,7 +93,12 @@ class Go2LaunchConfig:
         print(f"   Robot IPs: {self.robot_ip_list}")
         print(f"   Connection: {self.conn_type} ({self.conn_mode})")
         print(f"   URDF: {self.urdf_file}")
-    
+        print(f"   TF prefix: {self.tf_prefix or '<none>'}")
+
+    def frame(self, name: str) -> str:
+        """Namespace a frame id with this robot's tf_prefix"""
+        return prefix_frame(self.tf_prefix, name)
+
     def _parse_ip_list(self, robot_ip: str) -> List[str]:
         """Parse robot IP addresses from environment variable"""
         return robot_ip.replace(" ", "").split(",") if robot_ip else []
@@ -77,17 +138,25 @@ class Go2NodeFactory:
     def __init__(self, config: Go2LaunchConfig):
         self.config = config
     
-    def create_launch_arguments(self) -> List[DeclareLaunchArgument]:
+    @staticmethod
+    def create_launch_arguments() -> List[DeclareLaunchArgument]:
         """Create all launch arguments"""
         return [
             DeclareLaunchArgument('rviz2', default_value='true', description='Launch RViz2'),
             DeclareLaunchArgument('nav2', default_value='true', description='Launch Nav2'),
             DeclareLaunchArgument('slam', default_value='true', description='Launch SLAM'),
             DeclareLaunchArgument('localization', default_value='false', description='Launch AMCL for localization (use with saved map)'),
-            DeclareLaunchArgument('map', default_value=self.config.map_file, description='Full path to map yaml file for localization'),
+            DeclareLaunchArgument('map', default_value=os.getenv('MAP_FILE', ''), description='Full path to map yaml file for localization'),
             DeclareLaunchArgument('foxglove', default_value='true', description='Launch Foxglove Bridge'),
             DeclareLaunchArgument('joystick', default_value='true', description='Launch joystick'),
             DeclareLaunchArgument('teleop', default_value='true', description='Launch teleoperation'),
+            # /tf and /tf_static are global topics, so multiple robots can only
+            # share a tree if their frame ids differ. Set to '' for the original
+            # unprefixed frames.
+            DeclareLaunchArgument(
+                'tf_prefix', default_value='go2',
+                description='Prefix applied to every TF frame this robot publishes, '
+                            'e.g. "go2" yields go2/odom -> go2/base_link'),
         ]
     
     def create_robot_state_nodes(self) -> List[Node]:
@@ -107,7 +176,8 @@ class Go2NodeFactory:
                     output='screen',
                     parameters=[{
                         'use_sim_time': use_sim_time,
-                        'robot_description': robot_desc
+                        'robot_description': robot_desc,
+                        'frame_prefix': self.config.frame_prefix
                     }],
                     arguments=[self.config.config_paths['urdf']]
                 ),
@@ -129,7 +199,8 @@ class Go2NodeFactory:
                         namespace=f"robot{i}",
                         parameters=[{
                             'use_sim_time': use_sim_time,
-                            'robot_description': robot_desc
+                            'robot_description': robot_desc,
+                            'frame_prefix': self.config.frame_prefix
                         }],
                         arguments=[self.config.config_paths['urdf']]
                     ),
@@ -156,7 +227,7 @@ class Go2NodeFactory:
                     ('scan', f'{namespace}/scan'),
                 ],
                 parameters=[{
-                    'target_frame': f'{namespace}/base_link',
+                    'target_frame': self.config.frame(f'{namespace}/base_link'),
                     'max_height': 2.0,
                     'min_height': -0.2,
                     'angle_min': -3.14159,
@@ -180,7 +251,7 @@ class Go2NodeFactory:
                     ('scan', '/scan'),
                 ],
                 parameters=[{
-                    'target_frame': 'base_link',
+                    'target_frame': self.config.frame('base_link'),
                     'max_height': 2.0,
                     'min_height': -0.2,
                     'angle_min': -3.14159,
@@ -206,7 +277,8 @@ class Go2NodeFactory:
                 parameters=[{
                     'robot_ip': self.config.robot_ip,
                     'token': self.config.robot_token,
-                    'conn_type': self.config.conn_type
+                    'conn_type': self.config.conn_type,
+                    'tf_prefix': self.config.tf_prefix
                 }],
             ),
             # LiDAR processing node (C++ implementation)
@@ -234,7 +306,8 @@ class Go2NodeFactory:
                     'height_filter_min': -2.0,
                     'height_filter_max': 3.0,
                     'downsample_rate': 1,
-                    'publish_rate': 20.0
+                    'publish_rate': 20.0,
+                    'output_frame': self.config.frame('base_link')
                 }],
             ),
             # TTS Node (new separate package)
@@ -333,7 +406,8 @@ class Go2NodeFactory:
                 ]),
                 condition=IfCondition(with_slam),
                 launch_arguments={
-                    'slam_params_file': self.config.config_paths['slam'],
+                    'slam_params_file': rewrite_frame_params(
+                        self.config.config_paths['slam'], self.config.tf_prefix),
                     'use_sim_time': use_sim_time,
                 }.items(),
             ),
@@ -346,7 +420,8 @@ class Go2NodeFactory:
                 condition=IfCondition(with_localization),
                 launch_arguments={
                     'map': map_file,
-                    'params_file': self.config.config_paths['nav2'],
+                    'params_file': rewrite_frame_params(
+                        self.config.config_paths['nav2'], self.config.tf_prefix),
                     'use_sim_time': use_sim_time,
                 }.items(),
             ),
@@ -358,22 +433,22 @@ class Go2NodeFactory:
                 ]),
                 condition=IfCondition(with_nav2),
                 launch_arguments={
-                    'params_file': self.config.config_paths['nav2'],
+                    'params_file': rewrite_frame_params(
+                        self.config.config_paths['nav2'], self.config.tf_prefix),
                     'use_sim_time': use_sim_time,
                 }.items(),
             ),
         ]
 
 
-def generate_launch_description():
-    """Generate the launch description for Go2 robot system"""
-    
+def _launch_setup(context, *args, **kwargs):
+    """Build the Go2 stack, now that tf_prefix can be resolved"""
+
     # Initialize configuration and factory
-    config = Go2LaunchConfig()
+    config = Go2LaunchConfig(LaunchConfiguration('tf_prefix').perform(context))
     factory = Go2NodeFactory(config)
-    
+
     # Create all components
-    launch_args = factory.create_launch_arguments()
     robot_state_nodes = factory.create_robot_state_nodes()
     core_nodes = factory.create_core_nodes()
     teleop_nodes = factory.create_teleop_nodes()
@@ -381,13 +456,19 @@ def generate_launch_description():
     include_launches = factory.create_include_launches()
     
     # Combine all elements
-    launch_entities = (
-        launch_args +
+    return (
         robot_state_nodes +
         core_nodes +
         teleop_nodes +
         visualization_nodes +
         include_launches
     )
-    
-    return LaunchDescription(launch_entities)
+
+
+def generate_launch_description():
+    """Generate the launch description for Go2 robot system"""
+    return LaunchDescription(
+        Go2NodeFactory.create_launch_arguments() + [
+            OpaqueFunction(function=_launch_setup),
+        ]
+    )

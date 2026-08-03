@@ -65,6 +65,9 @@ void PointCloudAggregatorNode::declareParameters()
   this->declare_parameter("height_filter_max", 3.0);
   this->declare_parameter("downsample_rate", 10);
   this->declare_parameter("publish_rate", 5.0);
+  // Frame stamped on the aggregated cloud. Set to "<tf_prefix>/base_link"
+  // when several robots share one TF tree.
+  this->declare_parameter("output_frame", std::string("base_link"));
 }
 
 AggregatorConfig PointCloudAggregatorNode::loadConfiguration()
@@ -214,7 +217,7 @@ void PointCloudAggregatorNode::publishCallback()
     // Create header
     std_msgs::msg::Header header;
     header.stamp = this->get_clock()->now();
-    header.frame_id = "base_link";
+    header.frame_id = this->get_parameter("output_frame").as_string();
     
     // Publish filtered cloud
     sensor_msgs::msg::PointCloud2 filtered_msg;

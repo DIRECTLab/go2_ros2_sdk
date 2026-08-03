@@ -21,6 +21,11 @@ def load_urdf(context, *args, **kwargs):
     # Create full path to URDF
     urdf_file_path = os.path.join(pkg_dir, 'urdf', urdf_file_name)
 
+    # robot_state_publisher prepends frame_prefix verbatim, so it needs the
+    # trailing separator: '' -> '', 'go2' -> 'go2/'
+    tf_prefix = LaunchConfiguration('tf_prefix').perform(context).strip().strip('/')
+    frame_prefix = f'{tf_prefix}/' if tf_prefix else ''
+
     # Robot state publisher node
     robot_state_publisher_node = Node(
         package='robot_state_publisher',
@@ -31,7 +36,8 @@ def load_urdf(context, *args, **kwargs):
             'robot_description': ParameterValue(
                 Command(['cat ', urdf_file_path]),
                 value_type=str
-            )
+            ),
+            'frame_prefix': frame_prefix
         }],
         on_exit=LaunchConfiguration('on_exit'),
     )
@@ -89,6 +95,15 @@ def generate_launch_description():
             default_value='false',
             description='Enable obstacle avoidance',
         ),
+        # /tf and /tf_static are global topics, so multiple robots can only
+        # share a tree if their frame ids differ. Set to '' for the original
+        # unprefixed frames.
+        DeclareLaunchArgument(
+            'tf_prefix',
+            default_value='go2',
+            description='Prefix applied to every TF frame this robot publishes, '
+                        'e.g. "go2" yields go2/odom -> go2/base_link',
+        ),
         DeclareLaunchArgument(
             'enable_foxglove_bridge',
             default_value='true',
@@ -111,6 +126,7 @@ def generate_launch_description():
                     'decode_lidar': False,
                     'publish_raw_voxel': True,
                     'obstacle_avoidance': LaunchConfiguration('obstacle_avoidance'),
+                    'tf_prefix': LaunchConfiguration('tf_prefix'),
                 },
                     {
                     "qos_overrides": {

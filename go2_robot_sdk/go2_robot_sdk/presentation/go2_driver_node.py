@@ -136,6 +136,7 @@ class Go2DriverNode(Node):
                 ('decode_lidar', True),
                 ('publish_raw_voxel', False),
                 ('obstacle_avoidance', False),
+                ('tf_prefix', ''),
             ]
         )
 
@@ -150,7 +151,8 @@ class Go2DriverNode(Node):
             enable_video=self.get_parameter('enable_video').get_parameter_value().bool_value,
             decode_lidar=self.get_parameter('decode_lidar').get_parameter_value().bool_value,
             publish_raw_voxel=self.get_parameter('publish_raw_voxel').get_parameter_value().bool_value,
-            obstacle_avoidance=self.get_parameter('obstacle_avoidance').get_parameter_value().bool_value
+            obstacle_avoidance=self.get_parameter('obstacle_avoidance').get_parameter_value().bool_value,
+            tf_prefix=self.get_parameter('tf_prefix').get_parameter_value().string_value
         )
 
         # Log configuration
@@ -161,6 +163,7 @@ class Go2DriverNode(Node):
         self.get_logger().info(f"Decode lidar: {config.decode_lidar}")
         self.get_logger().info(f"Publish raw voxel: {config.publish_raw_voxel}")
         self.get_logger().info(f"Obstacle avoidance: {config.obstacle_avoidance}")
+        self.get_logger().info(f"TF prefix: {config.tf_prefix or '<none>'}")
 
         return config
 

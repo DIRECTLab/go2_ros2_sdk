@@ -2,19 +2,74 @@
 # Usage: ros2 launch go2_robot_sdk mapping.launch.py
 
 import os
+import tempfile
 from typing import List
+import yaml
 from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
 from launch.conditions import IfCondition
 from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
-from launch.actions import IncludeLaunchDescription, DeclareLaunchArgument
+from launch.actions import IncludeLaunchDescription, DeclareLaunchArgument, OpaqueFunction
 from launch.launch_description_sources import FrontendLaunchDescriptionSource, PythonLaunchDescriptionSource
 
 
-def generate_launch_description():
-    """Generate launch description for Go2 mapping mode"""
-    
+# Parameter keys whose value names a TF frame, across the nav2 and slam_toolbox
+# yaml files this stack loads.
+_FRAME_PARAM_KEYS = frozenset({
+    'base_frame', 'map_frame', 'odom_frame',
+    'base_frame_id', 'global_frame_id', 'odom_frame_id',
+    'global_frame', 'robot_base_frame', 'target_frame',
+})
+
+
+def prefix_frame(tf_prefix: str, frame: str) -> str:
+    """Namespace a frame id: '' -> 'base_link', 'go2' -> 'go2/base_link'."""
+    return f'{tf_prefix}/{frame}' if tf_prefix else frame
+
+
+def rewrite_frame_params(params_path: str, tf_prefix: str) -> str:
+    """Copy a params yaml with every TF frame value prefixed, return the new path.
+
+    Returns params_path untouched when tf_prefix is empty. A flat key->value
+    substitution would be wrong here: nav2 reuses 'global_frame' under several
+    nodes with different values ('map' for the global costmap, 'odom' for the
+    local one), so each value is prefixed in place instead.
+    """
+    if not tf_prefix:
+        return params_path
+
+    with open(params_path, 'r') as handle:
+        data = yaml.safe_load(handle)
+
+    def walk(node):
+        if isinstance(node, dict):
+            for key, value in node.items():
+                if key in _FRAME_PARAM_KEYS and isinstance(value, str) and value:
+                    node[key] = prefix_frame(tf_prefix, value)
+                else:
+                    walk(value)
+        elif isinstance(node, list):
+            for item in node:
+                walk(item)
+
+    walk(data)
+
+    rewritten = tempfile.NamedTemporaryFile(
+        mode='w', prefix='go2_frames_', suffix='.yaml', delete=False)
+    yaml.safe_dump(data, rewritten, default_flow_style=False)
+    rewritten.close()
+    return rewritten.name
+
+
+def _launch_setup(context, *args, **kwargs):
+    """Build the mapping-mode nodes, now that tf_prefix can be resolved"""
+
+    tf_prefix = LaunchConfiguration('tf_prefix').perform(context).strip().strip('/')
+    # robot_state_publisher prepends frame_prefix verbatim, so it needs the
+    # trailing separator: '' -> '', 'go2' -> 'go2/'
+    frame_prefix = f'{tf_prefix}/' if tf_prefix else ''
+
     # Environment variables
     robot_token = os.getenv('ROBOT_TOKEN', '')
     robot_ip = os.getenv('ROBOT_IP', '')
@@ -50,12 +105,6 @@ def generate_launch_description():
     with_foxglove = LaunchConfiguration('foxglove', default='true')
     with_joystick = LaunchConfiguration('joystick', default='true')
     
-    launch_args = [
-        DeclareLaunchArgument('rviz', default_value='false', description='Launch RViz2'),
-        DeclareLaunchArgument('foxglove', default_value='false', description='Launch Foxglove Bridge'),
-        DeclareLaunchArgument('joystick', default_value='false', description='Launch joystick control'),
-    ]
-    
     # Load URDF
     with open(config_paths['urdf'], 'r') as file:
         robot_desc = file.read()
@@ -70,7 +119,8 @@ def generate_launch_description():
             output='screen',
             parameters=[{
                 'use_sim_time': use_sim_time,
-                'robot_description': robot_desc
+                'robot_description': robot_desc,
+                'frame_prefix': frame_prefix
             }],
         ),
         # Main robot driver
@@ -82,7 +132,8 @@ def generate_launch_description():
             parameters=[{
                 'robot_ip': robot_ip,
                 'token': robot_token,
-                'conn_type': conn_type
+                'conn_type': conn_type,
+                'tf_prefix': tf_prefix
             }],
         ),
         # LiDAR processing node
@@ -110,7 +161,8 @@ def generate_launch_description():
                 'height_filter_min': -1.0,
                 'height_filter_max': 3.0,
                 'downsample_rate': 1,
-                'publish_rate': 20.0
+                'publish_rate': 20.0,
+                'output_frame': prefix_frame(tf_prefix, 'base_link')
             }],
         ),
         # PointCloud to LaserScan converter - maximum coverage
@@ -123,7 +175,7 @@ def generate_launch_description():
                 ('scan', '/go2/scan'),
             ],
             parameters=[{
-                'target_frame': 'base_link',
+                'target_frame': prefix_frame(tf_prefix, 'base_link'),
                 'max_height': 3.0,
                 'min_height': -1.0,
                 'angle_min': -3.14159,
@@ -211,15 +263,34 @@ def generate_launch_description():
             executable='async_slam_toolbox_node',
             name='slam_toolbox',
             output='screen',
-            parameters=[config_paths['slam'], {'use_sim_time': use_sim_time}],
+            parameters=[
+                rewrite_frame_params(config_paths['slam'], tf_prefix),
+                {'use_sim_time': use_sim_time}
+            ],
             remappings=[('map', '/go2/map'), ('map_updates', '/go2/map_updates')],
         ),
     ]
-    
-    return LaunchDescription(
-        launch_args +
+
+    return (
         core_nodes +
         teleop_nodes +
         viz_nodes +
         include_launches
     )
+
+
+def generate_launch_description():
+    """Generate launch description for Go2 mapping mode"""
+    return LaunchDescription([
+        DeclareLaunchArgument('rviz', default_value='false', description='Launch RViz2'),
+        DeclareLaunchArgument('foxglove', default_value='false', description='Launch Foxglove Bridge'),
+        DeclareLaunchArgument('joystick', default_value='false', description='Launch joystick control'),
+        # /tf and /tf_static are global topics, so multiple robots can only
+        # share a tree if their frame ids differ. Set to '' for the original
+        # unprefixed frames.
+        DeclareLaunchArgument(
+            'tf_prefix', default_value='go2',
+            description='Prefix applied to every TF frame this robot publishes, '
+                        'e.g. "go2" yields go2/odom -> go2/base_link'),
+        OpaqueFunction(function=_launch_setup),
+    ])

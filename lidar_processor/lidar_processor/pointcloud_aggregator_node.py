@@ -107,7 +107,10 @@ class PointCloudAggregatorNode(Node):
         self.declare_parameter('height_filter_max', 3.0)
         self.declare_parameter('downsample_rate', 10)
         self.declare_parameter('publish_rate', 5.0)
-    
+        # Frame stamped on the aggregated cloud. Set to '<tf_prefix>/base_link'
+        # when several robots share one TF tree.
+        self.declare_parameter('output_frame', 'base_link')
+
     def _load_configuration(self) -> AggregatorConfig:
         """Load configuration from parameters"""
         return AggregatorConfig(
@@ -211,7 +214,8 @@ class PointCloudAggregatorNode(Node):
             
             # Create header
             header = self.get_clock().now().to_msg()
-            header.frame_id = "base_link"
+            header.frame_id = self.get_parameter(
+                'output_frame').get_parameter_value().string_value
             
             # Publish filtered cloud
             filtered_msg = point_cloud2.create_cloud_xyz32(header, all_points.tolist())
