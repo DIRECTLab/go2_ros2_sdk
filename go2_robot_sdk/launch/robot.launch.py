@@ -385,7 +385,17 @@ class Go2NodeFactory:
                 parameters=[
                     rewrite_frame_params(self.config.config_paths['slam'],
                                          self.config.tf_prefix),
-                    {'use_sim_time': use_sim_time}
+                    {
+                        'use_sim_time': use_sim_time,
+                        # The yaml above is keyed 'slam_toolbox:', but
+                        # PushRosNamespace makes this node /go2/slam_toolbox, so
+                        # that key never matches and the file is ignored. These
+                        # are passed as direct overrides, which apply whatever
+                        # the node's namespace is.
+                        'map_frame': self.config.frame('map'),
+                        'odom_frame': self.config.frame('odom'),
+                        'base_frame': self.config.frame('base_link'),
+                    }
                 ],
                 remappings=[
                     ('/scan', '/go2/scan'),
