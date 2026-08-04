@@ -57,10 +57,23 @@ Stephen Brawner (brawner@gmail.com)
       link="base_link" />
   </joint>
 
+  <!-- base_footprint is the ground-projected body frame. The z offset is the
+       nominal standing height of base_link above the floor: the thigh and calf
+       links are 0.213 m each (see FL_thigh_joint / FL_calf_joint), so 0.426 m
+       fully extended, and the normal standing pose sits near 0.32 m.
+
+       This was xyz="0 0 0", which made base_footprint coincident with
+       base_link, so the floor appeared at z = -0.32 in a frame named
+       "footprint", and anything comparing heights against a genuinely
+       ground-referenced robot was off by that amount.
+
+       NOTE: a fixed joint can only approximate this. A quadruped's body height
+       changes as it walks and crouches, so treat 0.32 as a calibration
+       constant for the normal standing pose, not a fact about the robot. -->
   <joint name="base_footprint_joint" type="fixed">
     <parent link="base_link"/>
     <child link="base_footprint"/>
-    <origin xyz="0 0 0" rpy="0 0 0"/>
+    <origin xyz="0 0 -0.32" rpy="0 0 0"/>
   </joint>
   <link name="base_footprint">
     </link>
