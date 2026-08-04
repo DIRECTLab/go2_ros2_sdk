@@ -22,8 +22,8 @@ class RobotConfig:
     tf_prefix: str = ''
 
     @classmethod
-    def from_params(cls, robot_ip: str, token: str, conn_type: str,
-                   enable_video: bool, decode_lidar: bool,
+    def from_params(cls, robot_ip: str, token: str, aes_key: str,
+                   conn_type: str, enable_video: bool, decode_lidar: bool,
                    publish_raw_voxel: bool, obstacle_avoidance: bool,
                    tf_prefix: str = ''):
         """Создание конфигурации из параметров"""
