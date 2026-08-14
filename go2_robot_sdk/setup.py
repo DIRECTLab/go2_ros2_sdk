@@ -37,6 +37,7 @@ setup(
     entry_points={
         'console_scripts': [
             'go2_driver_node = go2_robot_sdk.main:main',
+            'raw_lidar_node = go2_robot_sdk.presentation.raw_lidar_node:main',
         ],
     },
 )

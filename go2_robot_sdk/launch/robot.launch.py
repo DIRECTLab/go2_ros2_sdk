@@ -156,6 +156,31 @@ class Go2NodeFactory:
                 'tf_prefix', default_value='go2',
                 description='Prefix applied to every TF frame this robot publishes, '
                             'e.g. "go2" yields go2/odom -> go2/base_link'),
+            # Raw lidar over CycloneDDS/Ethernet. Off by default: it is an
+            # additional feed alongside the driver's WebRTC point_cloud2, not a
+            # replacement, and it needs unitree_sdk2py plus a cabled link.
+            DeclareLaunchArgument(
+                'raw_lidar', default_value='false',
+                description='Publish the raw rt/utlidar/cloud feed over CycloneDDS'),
+            DeclareLaunchArgument(
+                'raw_lidar_iface', default_value=os.getenv('GO2_LIDAR_IFACE', ''),
+                description='Ethernet interface facing the robot, e.g. "eth0". '
+                            'Empty means every interface'),
+            DeclareLaunchArgument(
+                'raw_lidar_domain', default_value='0',
+                description='CycloneDDS domain id the robot publishes on'),
+            DeclareLaunchArgument(
+                'raw_lidar_topic', default_value='raw_lidar',
+                description='Topic for the raw cloud. Relative resolves under this '
+                            'stack\'s /go2 namespace; pass an absolute name such as '
+                            '/r0/raw_lidar to feed a Swarm-SLAM robot namespace'),
+            DeclareLaunchArgument(
+                'raw_lidar_frame', default_value='',
+                description='frame_id for the raw cloud. Empty derives '
+                            '<tf_prefix>/utlidar_lidar. This node publishes no TF'),
+            DeclareLaunchArgument(
+                'raw_lidar_stamp', default_value='raw',
+                description="Header stamp basis: 'raw', 'raw_header' or 'receive'"),
         ]
 
     def create_robot_state_nodes(self) -> List[Node]:
@@ -305,6 +330,41 @@ class Go2NodeFactory:
             ),
         ]
 
+    def create_raw_lidar_nodes(self, context) -> List[Node]:
+        """Create the raw lidar node (CycloneDDS over Ethernet).
+
+        Purely additive: the driver's existing WebRTC point_cloud2 topic is
+        untouched, and nothing here runs unless raw_lidar:=true.
+        """
+        with_raw_lidar = LaunchConfiguration('raw_lidar', default='false')
+
+        # Empty frame means "derive from tf_prefix", so the cloud lands in the
+        # same tree the rest of this launch file builds.
+        frame_id = LaunchConfiguration('raw_lidar_frame').perform(context)
+        if not frame_id:
+            frame_id = self.config.frame('utlidar_lidar')
+
+        # Resolved here rather than passed as a substitution: the node declares
+        # dds_domain_id as an integer, and substitutions arrive as strings.
+        domain_id = int(LaunchConfiguration('raw_lidar_domain').perform(context))
+
+        return [
+            Node(
+                package='go2_robot_sdk',
+                executable='raw_lidar_node',
+                name='raw_lidar_node',
+                output='screen',
+                condition=IfCondition(with_raw_lidar),
+                parameters=[{
+                    'network_interface': LaunchConfiguration('raw_lidar_iface'),
+                    'dds_domain_id': domain_id,
+                    'output_topic': LaunchConfiguration('raw_lidar_topic'),
+                    'frame_id': frame_id,
+                    'stamp_source': LaunchConfiguration('raw_lidar_stamp'),
+                }],
+            ),
+        ]
+
     def create_teleop_nodes(self) -> List[Node]:
         """Create teleoperation and joystick nodes"""
         use_sim_time = LaunchConfiguration('use_sim_time', default='false')
@@ -429,6 +489,7 @@ def _launch_setup(context, *args, **kwargs):
     # Create all components
     robot_state_nodes = factory.create_robot_state_nodes()
     core_nodes = factory.create_core_nodes()
+    raw_lidar_nodes = factory.create_raw_lidar_nodes(context)
     teleop_nodes = factory.create_teleop_nodes()
     visualization_nodes = factory.create_visualization_nodes()
     include_launches = factory.create_include_launches()
@@ -438,6 +499,7 @@ def _launch_setup(context, *args, **kwargs):
     launch_entities = (
         robot_state_nodes +
         core_nodes +
+        raw_lidar_nodes +
         teleop_nodes +
         visualization_nodes +
         include_launches

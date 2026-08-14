@@ -278,6 +278,33 @@ or
 export CONN_TYPE="cyclonedds"
 ```
 
+## Raw LiDAR over CycloneDDS (Ethernet)
+
+The WebRTC channel carries `voxel_map_compressed`, which the robot quantises to a
+5 cm lattice before transport. For the true per-scan cloud — what registration
+front-ends like KISS-ICP and cslam's FPFH→TEASER need — `raw_lidar_node`
+subscribes to the robot's `rt/utlidar/cloud` DDS topic directly over the cabled
+link and republishes it as `sensor_msgs/PointCloud2`.
+
+It is additive and off by default; `/go2/point_cloud2` is unaffected.
+
+```shell
+ros2 launch go2_robot_sdk robot.launch.py raw_lidar:=true raw_lidar_iface:=eth0
+```
+
+Standalone:
+
+```shell
+ros2 run go2_robot_sdk raw_lidar_node --ros-args -p network_interface:=eth0
+```
+
+Requires [`unitree_sdk2py`](https://github.com/unitreerobotics/unitree_sdk2_python)
+(not in rosdep). Configurable: `frame_id`, `output_topic` (pass an absolute name
+such as `/r0/raw_lidar` for a Swarm-SLAM robot namespace), `network_interface`,
+`dds_domain_id` and `stamp_source`. Full details, including the confirmed field
+layout, timestamping rationale and CycloneDDS troubleshooting, are in
+[`docs/RAW_LIDAR.md`](docs/RAW_LIDAR.md).
+
 ## Foxglove
 
 <p align="center">

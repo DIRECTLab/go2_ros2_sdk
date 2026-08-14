@@ -11,6 +11,12 @@
   <depend>go2_interfaces</depend>
   <!-- unitree_go merged into go2_interfaces -->
   <depend>sensor_msgs</depend>
+  <depend>rcl_interfaces</depend>
+
+  <!-- raw_lidar_node: reads rt/utlidar/cloud over CycloneDDS/Ethernet.
+       unitree_sdk2py is not in rosdep; install it from
+       https://github.com/unitreerobotics/unitree_sdk2_python -->
+  <exec_depend>python3-numpy</exec_depend>
 
   <exec_depend>twist_mux</exec_depend>
   <exec_depend>joy</exec_depend>
