@@ -1,0 +1,68 @@
+# Shared field-of-view mask for cross-robot comparison.
+#
+# The point of this file is that BOTH robots load the SAME one. The Go2's lidar
+# is factory-mounted inverted (165 deg) and the rover's L2 is upright, so the
+# only way their clouds describe the same content is to reduce both to an
+# identical band of the world. Copy this file to the rover's stack rather than
+# maintaining two sets of numbers.
+#
+# `mask_frame` is the exception: it must name the physically equivalent frame on
+# each robot, which differs by tf_prefix (go2/base_footprint vs
+# ganon/base_footprint). The launch files pass it as a direct override.
+#
+# Keyed '/**' on purpose. A key of 'fov_mask_node:' would never match, because
+# PushRosNamespace makes the node /go2/fov_mask_node -- the same bare-key/FQN
+# mismatch recorded as bugs #6 and #8 in docs/SWARM_SLAM_FINDINGS.md, which cost
+# a long debug when nav2 and the EKF silently ignored their params.
+/**:
+  ros__parameters:
+
+    # Gravity-aligned frame the mask is evaluated in. Overridden per robot.
+    mask_frame: base_footprint
+
+    # 'input' is a pure filter: surviving points keep their original frame and
+    # bytes. Switch to 'mask' to co-register both feeds into mask_frame for a
+    # side-by-side comparison.
+    publish_frame: input
+
+    # -- z band ---------------------------------------------------------------
+    # The primary knob. ScanContext bins by x,y and stores max(z+2.0) per cell
+    # (SWARM_SLAM_FINDINGS.md section 4), so z is what actually has to match.
+    # A z band also excludes the floor uniformly at every range, which an
+    # elevation band cannot.
+    #
+    # Starting point from section 4's post-fix table, where the rover measured
+    # z 5/50/95 = +0.05/+0.25/+0.85 and the Go2 +0.01/+0.11/+0.74:
+    #   z_min above the floor, z_max below the ceiling.
+    z_min: 0.15
+    z_max: 2.0
+
+    # -- range band -----------------------------------------------------------
+    # 'horizontal' matches ScanContext's x,y binning; 'euclidean' matches
+    # datasheet slant-range specs. Capping the rover (30 m) to the Go2's reach
+    # keeps both feeding the same rings -- section 4 found both robots populated
+    # only 2-3 of ScanContext's 20 rings.
+    range_mode: horizontal
+    min_range: 0.1
+    max_range: 4.5
+
+    # -- elevation cone -------------------------------------------------------
+    # Unbounded by default. Use this to emulate the cone one sensor physically
+    # cannot see beyond on the other robot, not to exclude the floor.
+    # Measured from the sensor's optical centre expressed in mask_frame.
+    elev_origin: sensor
+    elev_min_deg: -90.0
+    elev_max_deg: 90.0
+
+    # -- azimuth sector -------------------------------------------------------
+    # Full circle. Set a wedge to restrict both robots to a forward-facing view.
+    # If azim_min > azim_max the sector wraps through +/-180.
+    azim_min_deg: -180.0
+    azim_max_deg: 180.0
+
+    tf_timeout: 0.1
+
+    # Retention reports every N seconds. These percentiles are what you tune
+    # against: adjust the band until both robots retain overlapping
+    # distributions. 0 disables.
+    stats_period: 5.0

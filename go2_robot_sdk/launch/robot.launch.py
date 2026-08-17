@@ -182,6 +182,21 @@ class Go2NodeFactory:
             DeclareLaunchArgument(
                 'raw_lidar_stamp', default_value='raw',
                 description="Header stamp basis: 'raw', 'raw_header' or 'receive'"),
+            # FOV mask over the raw cloud, for cross-robot comparison. Off by
+            # default and purely additive: it publishes a second topic and
+            # leaves the unmasked feed alone.
+            DeclareLaunchArgument(
+                'fov_mask', default_value='false',
+                description='Mask the raw cloud down to a configurable region so it '
+                            'is comparable with another robot (requires raw_lidar)'),
+            DeclareLaunchArgument(
+                'fov_mask_params', default_value='',
+                description='Path to a mask yaml. Empty uses config/fov_mask.yaml. '
+                            'Point both robots at the same file'),
+            DeclareLaunchArgument(
+                'fov_mask_frame', default_value='',
+                description='Gravity-aligned frame the mask is evaluated in. '
+                            'Empty derives <tf_prefix>/base_footprint'),
         ]
 
     def create_robot_state_nodes(self) -> List[Node]:
@@ -382,6 +397,45 @@ class Go2NodeFactory:
             ),
         ]
 
+    def create_fov_mask_nodes(self, context) -> List[Node]:
+        """Create the FOV mask node over the raw cloud.
+
+        Additive: publishes <raw_lidar_topic>_masked and leaves the unmasked
+        feed untouched, so both can be compared side by side. Nothing runs
+        unless fov_mask:=true.
+        """
+        with_fov_mask = LaunchConfiguration('fov_mask', default='false')
+
+        params_file = LaunchConfiguration('fov_mask_params').perform(context)
+        if not params_file:
+            params_file = os.path.join(self.config.package_dir, 'config', 'fov_mask.yaml')
+
+        mask_frame = LaunchConfiguration('fov_mask_frame').perform(context)
+        if not mask_frame:
+            mask_frame = self.config.frame('base_footprint')
+
+        raw_topic = LaunchConfiguration('raw_lidar_topic').perform(context)
+
+        return [
+            Node(
+                package='lidar_processor',
+                executable='fov_mask',
+                name='fov_mask_node',
+                output='screen',
+                condition=IfCondition(with_fov_mask),
+                parameters=[
+                    params_file,
+                    # Direct override: mask_frame is the one value that cannot be
+                    # shared between robots, since it carries each one's prefix.
+                    {'mask_frame': mask_frame},
+                ],
+                remappings=[
+                    ('cloud_in', raw_topic),
+                    ('cloud_masked', f'{raw_topic}_masked'),
+                ],
+            ),
+        ]
+
     def create_teleop_nodes(self) -> List[Node]:
         """Create teleoperation and joystick nodes"""
         use_sim_time = LaunchConfiguration('use_sim_time', default='false')
@@ -507,6 +561,7 @@ def _launch_setup(context, *args, **kwargs):
     robot_state_nodes = factory.create_robot_state_nodes()
     core_nodes = factory.create_core_nodes()
     raw_lidar_nodes = factory.create_raw_lidar_nodes(context)
+    fov_mask_nodes = factory.create_fov_mask_nodes(context)
     teleop_nodes = factory.create_teleop_nodes()
     visualization_nodes = factory.create_visualization_nodes()
     include_launches = factory.create_include_launches()
@@ -517,6 +572,7 @@ def _launch_setup(context, *args, **kwargs):
         robot_state_nodes +
         core_nodes +
         raw_lidar_nodes +
+        fov_mask_nodes +
         teleop_nodes +
         visualization_nodes +
         include_launches

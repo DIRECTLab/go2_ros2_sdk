@@ -19,6 +19,11 @@
   
   <!-- 3D processing -->
   <depend>geometry_msgs</depend>
+
+  <!-- fov_mask node: evaluates its mask in a gravity-aligned frame via TF -->
+  <depend>rcl_interfaces</depend>
+  <depend>tf2_ros</depend>
+  <exec_depend>python3-numpy</exec_depend>
   
   <export>
     <build_type>ament_python</build_type>

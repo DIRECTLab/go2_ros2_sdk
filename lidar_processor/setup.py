@@ -21,6 +21,7 @@ setup(
         'console_scripts': [
             'lidar_to_pointcloud = lidar_processor.lidar_to_pointcloud_node:main',
             'pointcloud_aggregator = lidar_processor.pointcloud_aggregator_node:main',
+            'fov_mask = lidar_processor.fov_mask_node:main',
         ],
     },
 ) 

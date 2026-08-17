@@ -23,6 +23,24 @@ derivative.
 **Sanity check in RViz2:** a non-repetitive scanner produces a dense
 rosette/flower accumulation pattern. If you see a clean concentric lattice
 instead, something upstream changed and this is no longer the raw feed.
+Displaying `/go2/raw_lidar` and `/go2/point_cloud2` together makes the contrast
+obvious — the WebRTC feed renders as a visibly regular grid, the DDS feed as a
+rosette.
+
+**Effect on the `SWARM_SLAM_FINDINGS.md` §1 blockers.** Two of the three
+properties that made cross-robot loop closure unreachable were artefacts of the
+WebRTC transport, not of the hardware, and this feed removes them:
+
+| §1 blocker | on this feed |
+|---|---|
+| pre-quantised to a 5 cm lattice | gone |
+| short reach (~4.5 m) | gone |
+| inverted mount (`rpy="0 2.8782 0"`) | **remains** — factory-fixed |
+
+The mount was §1's binding constraint, so this does not by itself make cslam
+close inter-robot loops. It does mean the registration-parameter sweep §7
+advised against is worth one revisit, since FPFH now has real local sampling to
+histogram rather than a lattice.
 
 > **Note on `docs/SWARM_SLAM_FINDINGS.md`.** That investigation (2026-08-05)
 > found no `rt/utlidar/cloud` in the robot's DDS presence and concluded raw
@@ -110,23 +128,36 @@ is full`, the named frame is not in the tree. Check what is:
 ros2 run tf2_tools view_frames
 ```
 
-### Is the raw cloud actually in the sensor frame?
+### Is the raw cloud actually in the sensor frame? — verified yes
 
-Worth confirming rather than assuming, because the driver's *WebRTC* cloud is
-published in `odom`, not a sensor frame (`ros2_publisher.py` uses
-`config.frame("odom")`). If `rt/utlidar/cloud` were likewise pre-transformed,
-tagging it `radar` would apply the 165° mount rotation a second time.
+This needed checking rather than assuming, because the driver's *WebRTC* cloud
+is published in `odom`, not a sensor frame (`ros2_publisher.py` uses
+`config.frame("odom")`). Had `rt/utlidar/cloud` been likewise pre-transformed,
+tagging it `radar` would have applied the 165° mount rotation a second time.
 
-With the robot stationary on a flat floor, set RViz's fixed frame to
-`go2/odom` and compare:
+**Verified by overlay (2026-08-17):** displaying `/go2/raw_lidar` and
+`/go2/point_cloud2` together with fixed frame `go2/odom` puts both on the same
+floor plane, at the same scale, with the same vertical structures. A
+double-applied 165° would tip the raw cloud roughly 30° out of the WebRTC
+floor and is not present. `radar` is the right frame; the cloud arrives in the
+sensor's own coordinates.
 
-- **`frame_id:=go2/radar`** — correct if the floor comes out flat and roughly
-  0.4–0.5 m below `base_link`, matching the ground-plane fit in §4.
-- **`frame_id:=go2/odom`** — correct instead if `go2/radar` produces a cloud
-  tipped by ~165°, which means the points were already in a body/world frame.
+To re-confirm numerically without needing TF at all, fit the dominant plane in
+the cloud's own coordinates and read its tilt from the Z axis:
 
-Whichever is right, set it via `raw_lidar_frame`; do not add a second static
-transform to compensate.
+- **~15°** — sensor frame, `radar` correct. (164.9° mount ⇒ floor normal
+  `[-0.26, 0, -0.97]` in radar coords ⇒ 15.1° from Z.)
+- **~1°** — already gravity/body-aligned, which would mean `base_link` instead.
+
+Do not add a static transform to compensate for a frame mismatch; change
+`raw_lidar_frame` instead. A second authority on that edge is the conflict this
+node exists to avoid.
+
+**The frame's X axis is not the optical axis.** `radar` X maps to
+`[-0.97, 0, -0.26]` in `base_link` — mostly backward and slightly down — so the
+red X arrow in RViz will not line up with the visible centre of the scan
+pattern. That is expected for an inverted mount and is not evidence of a
+misconfigured frame.
 
 ## Parameters
 
