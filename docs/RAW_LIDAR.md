@@ -92,15 +92,51 @@ transforms and EKF/odometry stacks when both claim overlapping frames — see
 `SWARM_SLAM_FINDINGS.md` §3 bug #3 for the same class of problem inside this
 repo.
 
+The default `frame_id` is **`radar`** (`<tf_prefix>/radar` from the launch file),
+which is the lidar link `go2.urdf` already defines:
+
+```
+radar_joint: base_link → radar, xyz="0.28945 0 -0.046825" rpy="0 2.8782 0"
+```
+
+`robot_state_publisher` publishes that edge already, so the cloud resolves with
+no extra TF authority anywhere. The `rpy` is the inverted factory mount
+(165°) measured in `SWARM_SLAM_FINDINGS.md` §1.
+
+If RViz reports `Message Filter dropping message: frame '<something>' ... queue
+is full`, the named frame is not in the tree. Check what is:
+
+```bash
+ros2 run tf2_tools view_frames
+```
+
+### Is the raw cloud actually in the sensor frame?
+
+Worth confirming rather than assuming, because the driver's *WebRTC* cloud is
+published in `odom`, not a sensor frame (`ros2_publisher.py` uses
+`config.frame("odom")`). If `rt/utlidar/cloud` were likewise pre-transformed,
+tagging it `radar` would apply the 165° mount rotation a second time.
+
+With the robot stationary on a flat floor, set RViz's fixed frame to
+`go2/odom` and compare:
+
+- **`frame_id:=go2/radar`** — correct if the floor comes out flat and roughly
+  0.4–0.5 m below `base_link`, matching the ground-plane fit in §4.
+- **`frame_id:=go2/odom`** — correct instead if `go2/radar` produces a cloud
+  tipped by ~165°, which means the points were already in a body/world frame.
+
+Whichever is right, set it via `raw_lidar_frame`; do not add a second static
+transform to compensate.
+
 ## Parameters
 
 | parameter | default | meaning |
 |---|---|---|
-| `network_interface` | `''` | Ethernet interface facing the robot, e.g. `eth0`. Empty = all interfaces |
+| `network_interface` | `''` | Ethernet interface facing the robot, e.g. `eth0`. **Set this.** Empty does *not* mean "all interfaces" — it lets CycloneDDS pick one by its own heuristic, which chooses wrong on any machine that also has Wi-Fi |
 | `dds_domain_id` | `0` | CycloneDDS domain the robot publishes on |
 | `dds_topic` | `rt/utlidar/cloud` | DDS topic to subscribe to |
 | `output_topic` | `raw_lidar` | ROS2 topic. Relative takes the node namespace; absolute (e.g. `/r0/raw_lidar`) overrides it |
-| `frame_id` | `utlidar_lidar` | frame stamped on the cloud. No TF is published for it |
+| `frame_id` | `radar` | frame stamped on the cloud — the lidar link `go2.urdf` already defines. No TF is published for it |
 | `stamp_source` | `raw` | `raw` \| `raw_header` \| `receive` |
 | `queue_len` | `10` | DDS reader queue depth |
 | `verify_layout` | `true` | Compare each message against the confirmed layout and warn on drift |
@@ -126,7 +162,7 @@ ros2 run go2_robot_sdk raw_lidar_node --ros-args -p network_interface:=eth0
 With everything spelled out:
 
 ```bash
-ros2 run go2_robot_sdk raw_lidar_node --ros-args -p network_interface:=eth0 -p frame_id:=go2/utlidar_lidar -p output_topic:=/go2/raw_lidar -p stamp_source:=raw
+ros2 run go2_robot_sdk raw_lidar_node --ros-args -p network_interface:=eth0 -p frame_id:=go2/radar -p output_topic:=/go2/raw_lidar -p stamp_source:=raw
 ```
 
 ### Alongside the rest of the stack
@@ -145,7 +181,7 @@ Launch arguments:
 | `raw_lidar_iface` | `$GO2_LIDAR_IFACE` or `''` | network interface |
 | `raw_lidar_domain` | `0` | DDS domain id |
 | `raw_lidar_topic` | `raw_lidar` | resolves to `/go2/raw_lidar` under this launch file's `PushRosNamespace('go2')` |
-| `raw_lidar_frame` | `''` | empty derives `<tf_prefix>/utlidar_lidar` |
+| `raw_lidar_frame` | `''` | empty derives `<tf_prefix>/radar` |
 | `raw_lidar_stamp` | `raw` | stamp source |
 
 ### Feeding a Swarm-SLAM (cslam) robot namespace
@@ -160,7 +196,7 @@ ros2 launch go2_robot_sdk robot.launch.py raw_lidar:=true raw_lidar_iface:=eth0 
 or standalone:
 
 ```bash
-ros2 run go2_robot_sdk raw_lidar_node --ros-args -p network_interface:=eth0 -p output_topic:=/r1/raw_lidar -p frame_id:=go2/utlidar_lidar
+ros2 run go2_robot_sdk raw_lidar_node --ros-args -p network_interface:=eth0 -p output_topic:=/r1/raw_lidar -p frame_id:=go2/radar
 ```
 
 Robot id mapping used in `SWARM_SLAM_FINDINGS.md` is `r0` = rover (`ganon`),
@@ -197,16 +233,40 @@ ldd $(python3 -c "import cyclonedds._clayer as c; print(c.__file__)") | grep dds
 The lazy import keeps this failure confined to `raw_lidar_node` instead of
 taking down `go2_driver_node` with it.
 
-**No clouds arrive.** The node warns every `stale_timeout` seconds. Confirm the
-robot is reachable over the cabled link and that the topic is actually present:
+**No clouds arrive.** The node warns every `stale_timeout` seconds. Work through
+these in order — the interface is by far the most common cause.
 
-```bash
-ros2 run go2_robot_sdk raw_lidar_node --ros-args -p network_interface:=eth0 -p stale_timeout:=2.0
-```
+1. **Find the interface on the robot's cabled subnet.** The WebRTC/Wi-Fi address
+   (`ROBOT_IP`, e.g. `192.168.0.x`) is *not* it; DDS lidar traffic is on the
+   cabled `192.168.123.0/24` link.
 
-If `rt/utlidar/cloud` does not exist in the robot's DDS presence at all, this is
-the firmware gating described in `SWARM_SLAM_FINDINGS.md` §2, not a
-configuration error.
+   ```bash
+   ip -br addr
+   ```
+
+2. **Confirm the link is up**, using whichever `192.168.123.x` host answers
+   (`.161` is the robot's usual DDS address, `.18` its onboard computer):
+
+   ```bash
+   ping -c3 192.168.123.161
+   ```
+
+3. **Pass the interface explicitly**:
+
+   ```bash
+   ros2 run go2_robot_sdk raw_lidar_node --ros-args -p network_interface:=eth0 -p stale_timeout:=2.0
+   ```
+
+4. **If it is still silent, check the topic exists at all** before blaming
+   configuration. Bind ROS's own CycloneDDS to the same interface and enumerate:
+
+   ```bash
+   RMW_IMPLEMENTATION=rmw_cyclonedds_cpp CYCLONEDDS_URI='<CycloneDDS><Domain><General><Interfaces><NetworkInterface name="eth0"/></Interfaces></General></Domain></CycloneDDS>' ros2 topic list
+   ```
+
+   If `/utlidar/cloud` is absent and all you see is the sport/vui command API,
+   this is the firmware gating described in `SWARM_SLAM_FINDINGS.md` §2, not a
+   configuration error.
 
 **`unitree_sdk2py imported, but its sensor_msgs PointCloud2_ IDL type was not
 found`.** The IDL package path moved between `unitree_sdk2py` releases. The node

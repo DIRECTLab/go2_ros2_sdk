@@ -111,7 +111,10 @@ class RawLidarNode(Node):
             parameters=[
                 ('network_interface', '', ParameterDescriptor(
                     description='Ethernet interface facing the robot, e.g. "eth0". '
-                                'Empty means every interface.')),
+                                'Empty does NOT mean "all interfaces" -- it lets '
+                                'CycloneDDS pick one by its own heuristic, which '
+                                'chooses wrong on any machine that also has Wi-Fi. '
+                                'Set this explicitly.')),
                 ('dds_domain_id', 0, ParameterDescriptor(
                     description='CycloneDDS domain id the robot publishes on.')),
                 ('dds_topic', 'rt/utlidar/cloud', ParameterDescriptor(
@@ -122,10 +125,12 @@ class RawLidarNode(Node):
                                 'launch files); pass an absolute name such as '
                                 '/r0/raw_lidar to place it where Swarm-SLAM expects '
                                 'a given robot\'s data.')),
-                ('frame_id', 'utlidar_lidar', ParameterDescriptor(
-                    description='frame_id stamped on the published cloud. This node '
-                                'publishes no TF -- the frame must already exist in '
-                                'the tree someone else owns.')),
+                ('frame_id', 'radar', ParameterDescriptor(
+                    description='frame_id stamped on the published cloud. Defaults to '
+                                'the lidar link this repo\'s URDF already defines '
+                                '(base_link -> radar), so robot_state_publisher '
+                                'supplies the transform. This node publishes no TF -- '
+                                'the frame must already exist in someone else\'s tree.')),
                 ('stamp_source', 'raw', ParameterDescriptor(
                     description="Header stamp basis: 'raw' (robot's DDS header stamp "
                                 "shifted by the earliest per-point time offset), "
@@ -341,10 +346,11 @@ class RawLidarNode(Node):
 
     def _check_stale(self) -> None:
         if self._last_cloud_monotonic is None:
+            configured = self.network_interface or '<unset: CycloneDDS picked one>'
             self.get_logger().warn(
-                f"No cloud received on '{self.dds_topic}' yet. Check the Ethernet "
-                f"link and that network_interface ('{self.network_interface or '<all>'}') "
-                f"is the one facing the robot.", throttle_duration_sec=15.0)
+                f"No cloud received on '{self.dds_topic}' yet. network_interface is "
+                f"{configured} -- it must name the interface on the robot's cabled "
+                f"subnet. Check with 'ip -br addr'.", throttle_duration_sec=15.0)
             return
 
         silent_for = _time.monotonic() - self._last_cloud_monotonic

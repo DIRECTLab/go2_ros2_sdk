@@ -177,7 +177,8 @@ class Go2NodeFactory:
             DeclareLaunchArgument(
                 'raw_lidar_frame', default_value='',
                 description='frame_id for the raw cloud. Empty derives '
-                            '<tf_prefix>/utlidar_lidar. This node publishes no TF'),
+                            '<tf_prefix>/radar, the lidar link go2.urdf already '
+                            'defines. This node publishes no TF'),
             DeclareLaunchArgument(
                 'raw_lidar_stamp', default_value='raw',
                 description="Header stamp basis: 'raw', 'raw_header' or 'receive'"),
@@ -342,7 +343,10 @@ class Go2NodeFactory:
         # same tree the rest of this launch file builds.
         frame_id = LaunchConfiguration('raw_lidar_frame').perform(context)
         if not frame_id:
-            frame_id = self.config.frame('utlidar_lidar')
+            # 'radar' is the lidar link go2.urdf already defines, so
+            # robot_state_publisher supplies base_link -> radar and this node
+            # still needs to publish no TF of its own.
+            frame_id = self.config.frame('radar')
 
         # Resolved here rather than passed as a substitution: the node declares
         # dds_domain_id as an integer, and substitutions arrive as strings.
