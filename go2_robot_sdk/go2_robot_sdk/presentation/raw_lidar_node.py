@@ -125,12 +125,10 @@ class RawLidarNode(Node):
                                 'launch files); pass an absolute name such as '
                                 '/r0/raw_lidar to place it where Swarm-SLAM expects '
                                 'a given robot\'s data.')),
-                ('frame_id', 'radar', ParameterDescriptor(
+                ('frame_id', 'utlidar_lidar', ParameterDescriptor(
                     description='frame_id stamped on the published cloud. Defaults to '
-                                'the lidar link this repo\'s URDF already defines '
-                                '(base_link -> radar), so robot_state_publisher '
-                                'supplies the transform. This node publishes no TF -- '
-                                'the frame must already exist in someone else\'s tree.')),
+                                'the utlidar_lidar frame, which needs to be corrected by '
+                                'a static transform to the robots frame')),
                 ('stamp_source', 'raw', ParameterDescriptor(
                     description="Header stamp basis: 'raw' (robot's DDS header stamp "
                                 "shifted by the earliest per-point time offset), "

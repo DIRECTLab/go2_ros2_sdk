@@ -346,7 +346,7 @@ class Go2NodeFactory:
             # 'radar' is the lidar link go2.urdf already defines, so
             # robot_state_publisher supplies base_link -> radar and this node
             # still needs to publish no TF of its own.
-            frame_id = self.config.frame('radar')
+            frame_id = self.config.frame('utlidar_lidar')
 
         # Resolved here rather than passed as a substitution: the node declares
         # dds_domain_id as an integer, and substitutions arrive as strings.
@@ -366,6 +366,19 @@ class Go2NodeFactory:
                     'frame_id': frame_id,
                     'stamp_source': LaunchConfiguration('raw_lidar_stamp'),
                 }],
+            ),
+            Node(
+                package='tf2_ros',
+                executable='static_transform_publisher',
+                name='lidar_static_tf',
+                output='screen',
+                condition=IfCondition(with_raw_lidar),
+                # x y z yaw pitch roll parent_frame child_frame
+                arguments=[
+                           '0.28945', '0', '0.4', # offset from base_link (adjust to match physical mount)
+                           '2.1', '-3', '0.2', # rotation (yaw pitch roll in radians)
+                           'base_link',
+                           'utlidar_lidar'],
             ),
         ]
 
