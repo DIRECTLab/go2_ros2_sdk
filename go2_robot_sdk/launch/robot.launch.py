@@ -358,9 +358,8 @@ class Go2NodeFactory:
         # same tree the rest of this launch file builds.
         frame_id = LaunchConfiguration('raw_lidar_frame').perform(context)
         if not frame_id:
-            # 'radar' is the lidar link go2.urdf already defines, so
-            # robot_state_publisher supplies base_link -> radar and this node
-            # still needs to publish no TF of its own.
+            # The lidar's own frame, supplied by the static transform below
+            # rather than by the URDF, so the raw node still publishes no TF.
             frame_id = self.config.frame('utlidar_lidar')
 
         # Resolved here rather than passed as a substitution: the node declares
@@ -392,8 +391,8 @@ class Go2NodeFactory:
                 arguments=[
                            '0.28945', '0', '0.4', # offset from base_link (adjust to match physical mount)
                            '2.1', '-3', '0.2', # rotation (yaw pitch roll in radians)
-                           'base_link',
-                           'utlidar_lidar'],
+                           self.config.frame('base_link'),
+                           self.config.frame('utlidar_lidar')],
             ),
         ]
 
