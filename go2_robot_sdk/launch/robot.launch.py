@@ -195,8 +195,15 @@ class Go2NodeFactory:
                             'Point both robots at the same file'),
             DeclareLaunchArgument(
                 'fov_mask_frame', default_value='',
-                description='Gravity-aligned frame the mask is evaluated in. '
-                            'Empty derives <tf_prefix>/base_footprint'),
+                description='Frame supplying the mask axes and z datum. Empty '
+                            'derives <tf_prefix>/base_footprint; pass e.g. '
+                            'go2/odom for a datum that does not bob with the gait'),
+            DeclareLaunchArgument(
+                'fov_mask_origin', default_value='',
+                description="Where range/azimuth/elevation are measured from. Empty "
+                            "keeps the yaml's value ('sensor', which keeps the field "
+                            "of view attached to the robot). Accepts 'sensor', "
+                            "'mask_frame', or an explicit frame id"),
         ]
 
     def create_robot_state_nodes(self) -> List[Node]:
@@ -415,6 +422,14 @@ class Go2NodeFactory:
 
         raw_topic = LaunchConfiguration('raw_lidar_topic').perform(context)
 
+        # Direct overrides: these carry each robot's tf_prefix, so they cannot
+        # live in a yaml meant to be shared between robots. Empty means the
+        # yaml's own value stands.
+        overrides = {'mask_frame': mask_frame}
+        mask_origin = LaunchConfiguration('fov_mask_origin').perform(context)
+        if mask_origin:
+            overrides['mask_origin'] = mask_origin
+
         return [
             Node(
                 package='lidar_processor',
@@ -422,12 +437,7 @@ class Go2NodeFactory:
                 name='fov_mask_node',
                 output='screen',
                 condition=IfCondition(with_fov_mask),
-                parameters=[
-                    params_file,
-                    # Direct override: mask_frame is the one value that cannot be
-                    # shared between robots, since it carries each one's prefix.
-                    {'mask_frame': mask_frame},
-                ],
+                parameters=[params_file, overrides],
                 remappings=[
                     ('cloud_in', raw_topic),
                     ('cloud_masked', f'{raw_topic}_masked'),

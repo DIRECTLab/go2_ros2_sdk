@@ -60,9 +60,37 @@ constant z but at a range-dependent elevation — at 1 m it might be −20°, at
 ScanContext's x,y binning and is the default; `euclidean` matches datasheet
 slant-range specs.
 
-`elev_origin` picks where elevation is measured from: `sensor` (default) uses
-the cloud frame's origin expressed in `mask_frame`, making the band a true field
-of view; `mask_frame` measures from that frame's origin instead.
+## Two frame settings, and why they're separate
+
+`mask_frame` and `mask_origin` answer different questions, and conflating them
+is a real trap:
+
+- **`mask_frame`** supplies the mask **axes** and the **z datum** — what
+  "up" and "height" mean.
+- **`mask_origin`** is the point that **range, azimuth and elevation are
+  measured from** — where the field of view is anchored.
+
+Without the split, pointing `mask_frame` at a fixed odom frame would make the
+range band a shell around *wherever the robot booted* rather than around the
+robot. With `mask_origin: sensor` (the default), the axes and z datum come from
+`mask_frame` while the FOV still tracks the robot.
+
+z is deliberately **not** re-based on `mask_origin` — it is a datum in
+`mask_frame`, not a direction from a point.
+
+| what you want | `mask_frame` | `mask_origin` |
+|---|---|---|
+| FOV anchored to the robot, height above the floor | `<prefix>/base_footprint` | `sensor` |
+| Same, but a datum that doesn't bob with a legged gait | `<prefix>/odom` | `sensor` |
+| A fixed region of the world, robot-independent | `<prefix>/odom` | `mask_frame` |
+| Anchored at some other frame (e.g. the robot body) | either | `<prefix>/base_link` |
+
+**Picking the z datum for cross-robot work.** `base_footprint` sits on the
+ground on both robots by construction, so a z band means the same height above
+the floor on each — but on a legged robot it derives from a body that bobs.
+`odom` is fixed and gravity-aligned, but each robot's odom origin sits at a
+different height (§4 measured the Go2's floor at z = −0.128 m in `go2/odom`), so
+a shared z band there needs a per-robot offset to stay comparable.
 
 ## Tuning loop
 
@@ -93,13 +121,13 @@ on each robot, which differs by prefix (`go2/base_footprint` vs
 
 | parameter | default | meaning |
 |---|---|---|
-| `mask_frame` | `base_footprint` | gravity-aligned frame the mask is evaluated in |
+| `mask_frame` | `base_footprint` | frame supplying the mask axes and the z datum |
+| `mask_origin` | `sensor` | where range/azimuth/elevation are measured from: `sensor` \| `mask_frame` \| an explicit frame id |
 | `publish_frame` | `input` | `input` keeps points in their original frame (pure filter); `mask` rewrites x/y/z into `mask_frame` to co-register both feeds |
 | `z_min` / `z_max` | unbounded | z band in `mask_frame` |
 | `min_range` / `max_range` | `0` / unbounded | radial band |
 | `range_mode` | `horizontal` | `horizontal` \| `euclidean` |
-| `elev_min_deg` / `elev_max_deg` | `-90` / `90` | elevation cone |
-| `elev_origin` | `sensor` | `sensor` \| `mask_frame` |
+| `elev_min_deg` / `elev_max_deg` | `-90` / `90` | elevation cone, measured from `mask_origin` |
 | `azim_min_deg` / `azim_max_deg` | `-180` / `180` | azimuth sector, wraps if min > max |
 | `tf_timeout` | `0.1` | seconds before falling back to the latest transform |
 | `stats_period` | `5.0` | seconds between retention reports; `0` disables |
@@ -124,7 +152,16 @@ Publishes `/go2/raw_lidar_masked` alongside the untouched `/go2/raw_lidar`.
 |---|---|---|
 | `fov_mask` | `false` | enable the node |
 | `fov_mask_params` | `config/fov_mask.yaml` | path to the shared mask yaml |
-| `fov_mask_frame` | `''` | empty derives `<tf_prefix>/base_footprint` |
+| `fov_mask_frame` | `''` | mask axes / z datum; empty derives `<tf_prefix>/base_footprint` |
+| `fov_mask_origin` | `''` | measurement origin; empty keeps the yaml's value |
+
+Both frame arguments exist because their values carry each robot's `tf_prefix`
+and so cannot live in a yaml meant to be shared. For a datum that doesn't bob
+with the gait:
+
+```bash
+ros2 launch go2_robot_sdk robot.launch.py raw_lidar:=true raw_lidar_iface:=enP8p1s0 fov_mask:=true fov_mask_frame:=go2/odom
+```
 
 ### Standalone, on either robot
 

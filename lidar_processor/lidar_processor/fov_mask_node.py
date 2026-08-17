@@ -55,7 +55,8 @@ UNBOUNDED = 1.0e9
 
 RANGE_MODES = ('horizontal', 'euclidean')
 PUBLISH_FRAMES = ('input', 'mask')
-ELEV_ORIGINS = ('sensor', 'mask_frame')
+# mask_origin also accepts any explicit frame id, resolved through TF.
+MASK_ORIGIN_KEYWORDS = ('sensor', 'mask_frame')
 
 
 class FovMaskNode(Node):
@@ -105,9 +106,20 @@ class FovMaskNode(Node):
             namespace='',
             parameters=[
                 ('mask_frame', 'base_footprint', ParameterDescriptor(
-                    description='Gravity-aligned frame the mask is evaluated in. '
-                                'Must be the physically equivalent frame on both '
-                                'robots for the retained clouds to be comparable.')),
+                    description='Gravity-aligned frame supplying the mask AXES and '
+                                'the z datum. Set to a robot odom frame for a '
+                                'reference that does not bob with a legged gait; set '
+                                'to base_footprint for a z datum that sits on the '
+                                'ground on both robots by construction.')),
+                ('mask_origin', 'sensor', ParameterDescriptor(
+                    description='Where range, azimuth and elevation are measured '
+                                "FROM -- distinct from mask_frame, which only "
+                                "supplies the axes. 'sensor' uses the cloud frame's "
+                                "origin, so the field of view follows the robot even "
+                                "when mask_frame is a fixed odom frame. "
+                                "'mask_frame' measures from that frame's origin. Any "
+                                'other value is treated as an explicit frame id and '
+                                'resolved through TF.')),
                 ('publish_frame', 'input', ParameterDescriptor(
                     description="'input' republishes surviving points untouched in "
                                 "the cloud's original frame (a pure filter). 'mask' "
@@ -144,11 +156,6 @@ class FovMaskNode(Node):
                                 'physically cannot see beyond on the other robot.')),
                 ('elev_max_deg', 90.0, ParameterDescriptor(
                     description='Keep points at most this elevation, in degrees.')),
-                ('elev_origin', 'sensor', ParameterDescriptor(
-                    description="Where elevation is measured from. 'sensor' uses the "
-                                "cloud frame's origin expressed in mask_frame, making "
-                                "the band a true field of view. 'mask_frame' measures "
-                                "from that frame's origin instead.")),
 
                 # -- azimuth sector --------------------------------------------
                 ('azim_min_deg', -180.0, ParameterDescriptor(
@@ -172,6 +179,7 @@ class FovMaskNode(Node):
     def _read_parameters(self) -> None:
         get = self.get_parameter
         self.mask_frame = get('mask_frame').get_parameter_value().string_value
+        self.mask_origin = get('mask_origin').get_parameter_value().string_value
         self.publish_frame = get('publish_frame').get_parameter_value().string_value
         self.z_min = get('z_min').get_parameter_value().double_value
         self.z_max = get('z_max').get_parameter_value().double_value
@@ -180,7 +188,6 @@ class FovMaskNode(Node):
         self.range_mode = get('range_mode').get_parameter_value().string_value
         self.elev_min = math.radians(get('elev_min_deg').get_parameter_value().double_value)
         self.elev_max = math.radians(get('elev_max_deg').get_parameter_value().double_value)
-        self.elev_origin = get('elev_origin').get_parameter_value().string_value
         self.azim_min = math.radians(get('azim_min_deg').get_parameter_value().double_value)
         self.azim_max = math.radians(get('azim_max_deg').get_parameter_value().double_value)
         self.tf_timeout = get('tf_timeout').get_parameter_value().double_value
@@ -189,7 +196,6 @@ class FovMaskNode(Node):
         for name, value, valid in (
             ('range_mode', self.range_mode, RANGE_MODES),
             ('publish_frame', self.publish_frame, PUBLISH_FRAMES),
-            ('elev_origin', self.elev_origin, ELEV_ORIGINS),
         ):
             if value not in valid:
                 self.get_logger().warn(
@@ -226,11 +232,16 @@ class FovMaskNode(Node):
                     throttle_duration_sec=30.0)
                 return
 
-            transform = self._lookup_transform(msg)
+            transform = self._lookup_transform(self.mask_frame, msg.header)
             if transform is None:
                 self._dropped_msgs += 1
                 return
             rotation, translation = transform
+
+            origin = self._resolve_origin(msg, translation)
+            if origin is None:
+                self._dropped_msgs += 1
+                return
 
             view = np.frombuffer(payload, dtype=xyz_dtype, count=n_points)
             xyz = np.stack([view['x'], view['y'], view['z']], axis=1).astype(np.float64)
@@ -239,7 +250,7 @@ class FovMaskNode(Node):
             # something consistent across two differently-mounted sensors.
             masked_xyz = xyz @ rotation.T + translation
 
-            keep, metrics = self._evaluate_mask(masked_xyz, translation)
+            keep, metrics = self._evaluate_mask(masked_xyz, origin)
 
             self._msgs += 1
             self._points_in += n_points
@@ -284,23 +295,22 @@ class FovMaskNode(Node):
         self._dtype_cache[key] = dtype
         return dtype
 
-    def _lookup_transform(self, msg: PointCloud2):
-        """(3x3 rotation, 3-vector translation) taking cloud frame -> mask_frame."""
-        source = msg.header.frame_id
+    def _lookup_transform(self, target: str, header, source: str = None):
+        """(3x3 rotation, 3-vector translation) taking `source` -> `target`."""
+        source = source or header.frame_id
         try:
             tf = self.tf_buffer.lookup_transform(
-                self.mask_frame, source, Time.from_msg(msg.header.stamp),
+                target, source, Time.from_msg(header.stamp),
                 timeout=Duration(seconds=self.tf_timeout))
         except TransformException:
             # Falling back to the latest available transform. Correct for the
             # static sensor->base edge; a small lag on a dynamic one, which
             # beats dropping the scan outright.
             try:
-                tf = self.tf_buffer.lookup_transform(
-                    self.mask_frame, source, Time())
+                tf = self.tf_buffer.lookup_transform(target, source, Time())
             except TransformException as exc:
                 self.get_logger().warn(
-                    f"TF {self.mask_frame} <- {source} unavailable: {exc}",
+                    f"TF {target} <- {source} unavailable: {exc}",
                     throttle_duration_sec=10.0)
                 return None
 
@@ -308,21 +318,44 @@ class FovMaskNode(Node):
         q = tf.transform.rotation
         return _quat_to_matrix(q.x, q.y, q.z, q.w), np.array([t.x, t.y, t.z])
 
-    def _evaluate_mask(self, pts: np.ndarray, sensor_origin: np.ndarray):
-        """Boolean keep-mask plus the per-point metrics, for stats."""
+    def _resolve_origin(self, msg: PointCloud2, sensor_translation: np.ndarray):
+        """The point in mask_frame that range/azimuth/elevation are measured from.
+
+        Separate from mask_frame on purpose. With mask_frame set to a fixed odom
+        frame -- stable, and not bobbing with a legged gait -- the axes and z
+        datum come from odom while the field of view still follows the robot,
+        rather than becoming a shell around wherever odom happens to sit.
+        """
+        if self.mask_origin == 'sensor':
+            return sensor_translation
+        if self.mask_origin == 'mask_frame':
+            return np.zeros(3)
+
+        transform = self._lookup_transform(
+            self.mask_frame, msg.header, source=self.mask_origin)
+        if transform is None:
+            return None
+        return transform[1]
+
+    def _evaluate_mask(self, pts: np.ndarray, origin: np.ndarray):
+        """Boolean keep-mask plus the per-point metrics, for stats.
+
+        Range, azimuth and elevation are all measured from `origin`; z is not,
+        because z is a datum in mask_frame rather than a direction from a point.
+        That split is what lets mask_frame be a fixed odom frame while the field
+        of view still tracks the robot.
+        """
         x, y, z = pts[:, 0], pts[:, 1], pts[:, 2]
 
-        horizontal = np.hypot(x, y)
-        rng = horizontal if self.range_mode == 'horizontal' else np.linalg.norm(pts, axis=1)
+        # Offsets from the measurement origin, in the mask frame's axes.
+        dx, dy, dz = x - origin[0], y - origin[1], z - origin[2]
 
-        # Elevation from the sensor's optical centre makes the band a true field
-        # of view; from the mask frame's origin it is a band of the world.
-        if self.elev_origin == 'sensor':
-            ex, ey, ez = x - sensor_origin[0], y - sensor_origin[1], z - sensor_origin[2]
-        else:
-            ex, ey, ez = x, y, z
-        elevation = np.arctan2(ez, np.hypot(ex, ey))
-        azimuth = np.arctan2(y, x)
+        horizontal = np.hypot(dx, dy)
+        rng = horizontal if self.range_mode == 'horizontal' else np.sqrt(
+            dx * dx + dy * dy + dz * dz)
+
+        elevation = np.arctan2(dz, horizontal)
+        azimuth = np.arctan2(dy, dx)
 
         keep = np.isfinite(pts).all(axis=1)
         keep &= (z >= self.z_min) & (z <= self.z_max)
@@ -402,7 +435,9 @@ class FovMaskNode(Node):
     def _log_configuration(self) -> None:
         unbounded = lambda v: '<none>' if abs(v) >= UNBOUNDED else f'{v:.2f}'
         self.get_logger().info("FOV Mask Configuration:")
-        self.get_logger().info(f"   Mask frame: {self.mask_frame}")
+        self.get_logger().info(f"   Mask frame (axes, z datum): {self.mask_frame}")
+        self.get_logger().info(
+            f"   Mask origin (range/azim/elev measured from): {self.mask_origin}")
         self.get_logger().info(f"   Publish frame: {self.publish_frame}")
         self.get_logger().info(
             f"   z band: [{unbounded(self.z_min)}, {unbounded(self.z_max)}]")
@@ -410,8 +445,8 @@ class FovMaskNode(Node):
             f"   range ({self.range_mode}): "
             f"[{self.min_range:.2f}, {unbounded(self.max_range)}]")
         self.get_logger().info(
-            f"   elevation from {self.elev_origin}: "
-            f"[{math.degrees(self.elev_min):.1f}, {math.degrees(self.elev_max):.1f}] deg")
+            f"   elevation: [{math.degrees(self.elev_min):.1f}, "
+            f"{math.degrees(self.elev_max):.1f}] deg")
         self.get_logger().info(
             f"   azimuth: [{math.degrees(self.azim_min):.1f}, "
             f"{math.degrees(self.azim_max):.1f}] deg")

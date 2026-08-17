@@ -17,8 +17,28 @@
 /**:
   ros__parameters:
 
-    # Gravity-aligned frame the mask is evaluated in. Overridden per robot.
+    # Two independent frame settings, both overridden per robot by the launch
+    # files (their values carry each robot's tf_prefix, so they cannot live in a
+    # file that is meant to be shared).
+    #
+    # mask_frame supplies the mask AXES and the z datum. Options that matter:
+    #   <prefix>/base_footprint -- sits on the ground on both robots by
+    #       construction, so a z band means the same height above the floor on
+    #       each. Moves with the robot, and on a legged robot it is derived from
+    #       a body that bobs.
+    #   <prefix>/odom -- fixed and gravity-aligned, so it does not bob with the
+    #       gait. But each robot's odom origin sits at a different height (the
+    #       Go2's floor measured z = -0.128 m in go2/odom, section 4), so a
+    #       shared z band needs a per-robot offset to stay comparable.
     mask_frame: base_footprint
+
+    # mask_origin is where range, azimuth and elevation are measured FROM.
+    # 'sensor' keeps the field of view attached to the robot even when
+    # mask_frame is a fixed odom frame -- without this, setting mask_frame to
+    # odom would make the range band a shell around wherever the robot booted.
+    # 'mask_frame' measures from that frame's origin; any other value is treated
+    # as an explicit frame id and resolved through TF.
+    mask_origin: sensor
 
     # 'input' is a pure filter: surviving points keep their original frame and
     # bytes. Switch to 'mask' to co-register both feeds into mask_frame for a
@@ -49,8 +69,7 @@
     # -- elevation cone -------------------------------------------------------
     # Unbounded by default. Use this to emulate the cone one sensor physically
     # cannot see beyond on the other robot, not to exclude the floor.
-    # Measured from the sensor's optical centre expressed in mask_frame.
-    elev_origin: sensor
+    # Measured from mask_origin, in mask_frame's axes.
     elev_min_deg: -90.0
     elev_max_deg: 90.0
 
