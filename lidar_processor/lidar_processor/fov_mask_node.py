@@ -148,6 +148,17 @@ class FovMaskNode(Node):
                                 "ScanContext bins (by x,y only). 'euclidean' measures "
                                 "true slant range, matching sensor datasheet specs.")),
 
+                # -- self-hit blanking -----------------------------------------
+                ('sensor_blank_radius', 0.0, ParameterDescriptor(
+                    description='Drop points within this euclidean distance of the '
+                                'SENSOR origin, in metres, to remove returns off the '
+                                "lidar's own mount. Deliberately separate from "
+                                'min_range: always a sphere and always measured from '
+                                'the cloud frame origin, independent of range_mode '
+                                'and mask_origin, because the mount is bolted to the '
+                                'sensor and does not move when the measurement origin '
+                                'does. 0 disables.')),
+
                 # -- elevation cone --------------------------------------------
                 ('elev_min_deg', -90.0, ParameterDescriptor(
                     description='Keep points at least this elevation above horizontal, '
@@ -186,6 +197,8 @@ class FovMaskNode(Node):
         self.min_range = get('min_range').get_parameter_value().double_value
         self.max_range = get('max_range').get_parameter_value().double_value
         self.range_mode = get('range_mode').get_parameter_value().string_value
+        self.sensor_blank_radius = get(
+            'sensor_blank_radius').get_parameter_value().double_value
         self.elev_min = math.radians(get('elev_min_deg').get_parameter_value().double_value)
         self.elev_max = math.radians(get('elev_max_deg').get_parameter_value().double_value)
         self.azim_min = math.radians(get('azim_min_deg').get_parameter_value().double_value)
@@ -250,7 +263,7 @@ class FovMaskNode(Node):
             # something consistent across two differently-mounted sensors.
             masked_xyz = xyz @ rotation.T + translation
 
-            keep, metrics = self._evaluate_mask(masked_xyz, origin)
+            keep, metrics = self._evaluate_mask(masked_xyz, origin, xyz)
 
             self._msgs += 1
             self._points_in += n_points
@@ -337,13 +350,18 @@ class FovMaskNode(Node):
             return None
         return transform[1]
 
-    def _evaluate_mask(self, pts: np.ndarray, origin: np.ndarray):
+    def _evaluate_mask(self, pts: np.ndarray, origin: np.ndarray,
+                       sensor_xyz: np.ndarray):
         """Boolean keep-mask plus the per-point metrics, for stats.
 
         Range, azimuth and elevation are all measured from `origin`; z is not,
         because z is a datum in mask_frame rather than a direction from a point.
         That split is what lets mask_frame be a fixed odom frame while the field
         of view still tracks the robot.
+
+        `sensor_xyz` is the untransformed cloud, used only for the self-hit
+        blanking sphere, which is anchored to the sensor rather than to
+        `origin`.
         """
         x, y, z = pts[:, 0], pts[:, 1], pts[:, 2]
 
@@ -357,10 +375,20 @@ class FovMaskNode(Node):
         elevation = np.arctan2(dz, horizontal)
         azimuth = np.arctan2(dy, dx)
 
+        # Distance from the sensor origin, in the sensor's own frame. Rigid
+        # transforms preserve distance, so this is the same sphere whatever
+        # mask_frame is -- and it ignores mask_origin and range_mode on
+        # purpose: the mount is attached to the sensor, not to the frame you
+        # happen to be measuring the field of view from.
+        sensor_r = np.sqrt((sensor_xyz * sensor_xyz).sum(axis=1))
+
         keep = np.isfinite(pts).all(axis=1)
         keep &= (z >= self.z_min) & (z <= self.z_max)
         keep &= (rng >= self.min_range) & (rng <= self.max_range)
         keep &= (elevation >= self.elev_min) & (elevation <= self.elev_max)
+
+        if self.sensor_blank_radius > 0.0:
+            keep &= sensor_r >= self.sensor_blank_radius
 
         if self.azim_min <= self.azim_max:
             keep &= (azimuth >= self.azim_min) & (azimuth <= self.azim_max)
@@ -368,7 +396,8 @@ class FovMaskNode(Node):
             # Sector wrapping through +/-180.
             keep &= (azimuth >= self.azim_min) | (azimuth <= self.azim_max)
 
-        return keep, {'z': z, 'range': rng, 'elev': np.degrees(elevation)}
+        return keep, {'z': z, 'range': rng, 'elev': np.degrees(elevation),
+                      'sens_r': sensor_r}
 
     def _publish(self, msg: PointCloud2, payload: bytes, point_step: int,
                  n_points: int, keep: np.ndarray, masked_xyz: np.ndarray,
@@ -433,7 +462,9 @@ class FovMaskNode(Node):
         self._msgs = self._points_in = self._points_out = self._dropped_msgs = 0
 
     def _log_configuration(self) -> None:
-        unbounded = lambda v: '<none>' if abs(v) >= UNBOUNDED else f'{v:.2f}'
+        def unbounded(v):
+            return '<none>' if abs(v) >= UNBOUNDED else f'{v:.2f}'
+
         self.get_logger().info("FOV Mask Configuration:")
         self.get_logger().info(f"   Mask frame (axes, z datum): {self.mask_frame}")
         self.get_logger().info(
@@ -444,6 +475,9 @@ class FovMaskNode(Node):
         self.get_logger().info(
             f"   range ({self.range_mode}): "
             f"[{self.min_range:.2f}, {unbounded(self.max_range)}]")
+        blank = ('<off>' if self.sensor_blank_radius <= 0.0
+                 else f'{self.sensor_blank_radius:.3f} m')
+        self.get_logger().info(f"   sensor blank radius: {blank}")
         self.get_logger().info(
             f"   elevation: [{math.degrees(self.elev_min):.1f}, "
             f"{math.degrees(self.elev_max):.1f}] deg")

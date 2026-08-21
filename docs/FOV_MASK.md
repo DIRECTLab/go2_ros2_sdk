@@ -42,8 +42,8 @@ region than the same numbers on the rover.
 
 ## Choosing a mask primitive
 
-Four independent filters, composable, all **unbounded by default** (the node is
-a no-op until you configure it).
+Five independent filters, composable, all **unbounded or off by default** (the
+node is a no-op until you configure it).
 
 | primitive | use it for |
 |---|---|
@@ -51,6 +51,7 @@ a no-op until you configure it).
 | **range band** | capping the rover (30 m spec) to the Go2's reach so both populate the same ScanContext rings — §4 found both robots reaching only 2–3 of 20 |
 | **elevation cone** | emulating the cone one sensor physically *cannot* see beyond, on the other robot |
 | **azimuth sector** | restricting both to a forward-facing wedge. Wraps if `azim_min > azim_max` |
+| **sensor blank radius** | deleting returns off the lidar's own mount. Unlike the four above this is not part of the shared band — it describes hardware, so the value is legitimately per-robot |
 
 **Elevation is not the right tool for excluding the floor.** Floor sits at
 constant z but at a range-dependent elevation — at 1 m it might be −20°, at 4 m
@@ -59,6 +60,43 @@ constant z but at a range-dependent elevation — at 1 m it might be −20°, at
 `range_mode` picks what "range" means: `horizontal` (√(x²+y²)) matches
 ScanContext's x,y binning and is the default; `euclidean` matches datasheet
 slant-range specs.
+
+### `sensor_blank_radius` vs `min_range`
+
+They look similar and are not interchangeable. `min_range` is part of the
+*shared band* — it obeys `range_mode` and is measured from `mask_origin`.
+`sensor_blank_radius` is *physical self-filtering* — always a sphere, always
+measured from the cloud frame's own origin.
+
+|  | `min_range` | `sensor_blank_radius` |
+|---|---|---|
+| shape | follows `range_mode` (`horizontal` by default → a cylinder) | always a sphere |
+| measured from | `mask_origin` | the sensor, always |
+| purpose | the shared cross-robot band | deleting the lidar's own mount |
+
+The naive argument for why `min_range` can't do this job is wrong, and it's
+worth being precise: horizontal distance is never greater than euclidean, so a
+`min_range` of r *does* catch every point an r-sphere catches. It is not too
+weak — it is too **strong**. At `range_mode: horizontal` it carves out an
+infinite vertical **cylinder** through the sensor, deleting the ceiling directly
+overhead and the floor directly underneath at every height.
+`sensor_blank_radius` removes a bounded **ball** and nothing past it.
+
+Measured at r = 0.2 m on the rover's mount geometry: both drop the same four
+mount returns, but a ceiling return 3 m above the sensor survives the sphere and
+is deleted by `min_range`. Same radius, different shape, and the difference is
+real data.
+
+Switching `range_mode` to `euclidean` to fix the shape isn't an option either —
+it's shared with `max_range`, so you'd stop matching ScanContext's x,y binning.
+And with `mask_origin` set to anything other than `sensor`, `min_range`'s
+exclusion zone detaches from the sensor entirely, while the mount, bolted to it,
+does not.
+
+Because it describes hardware rather than the shared band, the *value* is
+legitimately per-robot — the Go2's factory head mount and the rover's L2 mast
+are different geometry. Override it with `-p sensor_blank_radius:=0.12` rather
+than forking the shared yaml.
 
 ## Two frame settings, and why they're separate
 
@@ -98,8 +136,14 @@ Nothing computes the angles for you. The node reports what survived, and you
 adjust until both robots' retained distributions overlap:
 
 ```
-masked 47 clouds | kept 1204/3847 (31.3%) | z 5/50/95: 0.21/0.58/1.74 | range 5/50/95: 0.91/2.44/4.31 | elev 5/50/95: -8.2/4.1/22.6
+masked 47 clouds | kept 1204/3847 (31.3%) | z 5/50/95: 0.21/0.58/1.74 | range 5/50/95: 0.91/2.44/4.31 | elev 5/50/95: -8.2/4.1/22.6 | sens_r 5/50/95: 0.34/2.51/4.40
 ```
+
+`sens_r` is the euclidean distance of survivors from the sensor, and it is how
+you size `sensor_blank_radius`: leave the radius at 0, look at where the 5th
+percentile sits to find your mount returns, then raise the radius until it
+clears them — and stop there, because past that you are discarding real
+geometry.
 
 Those are the same 5/50/95 percentiles §4 tabulated by hand, live on both
 robots. Run it on each, compare, adjust the shared yaml, repeat.
@@ -127,6 +171,7 @@ on each robot, which differs by prefix (`go2/base_footprint` vs
 | `z_min` / `z_max` | unbounded | z band in `mask_frame` |
 | `min_range` / `max_range` | `0` / unbounded | radial band |
 | `range_mode` | `horizontal` | `horizontal` \| `euclidean` |
+| `sensor_blank_radius` | `0.0` | drop points within this euclidean radius of the **sensor** origin, for self-hit removal; `0` disables |
 | `elev_min_deg` / `elev_max_deg` | `-90` / `90` | elevation cone, measured from `mask_origin` |
 | `azim_min_deg` / `azim_max_deg` | `-180` / `180` | azimuth sector, wraps if min > max |
 | `tf_timeout` | `0.1` | seconds before falling back to the latest transform |

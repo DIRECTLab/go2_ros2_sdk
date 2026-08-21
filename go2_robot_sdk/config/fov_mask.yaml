@@ -66,6 +66,24 @@
     min_range: 0.1
     max_range: 4.5
 
+    # -- self-hit blanking ----------------------------------------------------
+    # Drops everything within this euclidean radius of the SENSOR origin, to
+    # remove returns off the lidar's own mount. Separate from min_range on
+    # purpose: this is always a sphere measured from the cloud frame origin,
+    # regardless of range_mode (which stays 'horizontal' for ScanContext) and
+    # regardless of mask_origin -- the mount is bolted to the sensor, so it
+    # does not move when the measurement origin does. 0 disables.
+    #
+    # This value is physical, not a shared-band setting: the Go2's factory head
+    # mount and the rover's L2 mast are different hardware, so the two robots
+    # may legitimately need different numbers here. Override per robot with
+    # `-p sensor_blank_radius:=...` rather than forking the file.
+    #
+    # Tune it from the retention stats: raise it until the `sens_r` 5th
+    # percentile clears your mount, then stop -- every extra centimetre is
+    # real geometry thrown away.
+    sensor_blank_radius: 0.0
+
     # -- elevation cone -------------------------------------------------------
     # Unbounded by default. Use this to emulate the cone one sensor physically
     # cannot see beyond on the other robot, not to exclude the floor.
