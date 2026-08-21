@@ -54,7 +54,7 @@
     # Starting point from section 4's post-fix table, where the rover measured
     # z 5/50/95 = +0.05/+0.25/+0.85 and the Go2 +0.01/+0.11/+0.74:
     #   z_min above the floor, z_max below the ceiling.
-    z_min: 0.15
+    z_min: 0.18
     z_max: 2.0
 
     # -- range band -----------------------------------------------------------

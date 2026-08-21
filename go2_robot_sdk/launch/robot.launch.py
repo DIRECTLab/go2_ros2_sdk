@@ -396,8 +396,8 @@ class Go2NodeFactory:
                 condition=IfCondition(with_raw_lidar),
                 # x y z yaw pitch roll parent_frame child_frame
                 arguments=[
-                           '0.28945', '0', '0.4', # offset from base_link (adjust to match physical mount)
-                           '2.1', '-3', '0.2', # rotation (yaw pitch roll in radians)
+                           '0.28945', '0', '0.45', # offset from base_link (adjust to match physical mount)
+                           '2.1', '-2.95', '0.23', # rotation (yaw pitch roll in radians)
                            self.config.frame('base_link'),
                            self.config.frame('utlidar_lidar')],
             ),
