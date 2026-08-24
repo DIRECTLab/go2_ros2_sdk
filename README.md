@@ -308,7 +308,8 @@ layout, timestamping rationale and CycloneDDS troubleshooting, are in
 To reduce that feed to a band comparable with another robot's lidar — for
 multi-robot SLAM across differently-mounted sensors — add `fov_mask:=true`. It
 masks by z, range, elevation and azimuth in a gravity-aligned frame, blanks a
-sphere around the sensor to drop returns off its own mount, and reports
+sphere around the sensor to drop returns off its own mount, optionally
+accumulates points over time like RViz2's Decay Time, and reports
 what it retained so both robots can be tuned to overlap. See
 [`docs/FOV_MASK.md`](docs/FOV_MASK.md).
 

@@ -204,6 +204,17 @@ class Go2NodeFactory:
                             "keeps the yaml's value ('sensor', which keeps the field "
                             "of view attached to the robot). Accepts 'sensor', "
                             "'mask_frame', or an explicit frame id"),
+            DeclareLaunchArgument(
+                'fov_mask_decay', default_value='',
+                description="Seconds of history to accumulate, like RViz2's Decay "
+                            'Time. Switches cloud_processed from per-scan masked '
+                            "clouds to the accumulated history. Empty keeps the yaml's "
+                            'value; 0 disables accumulation'),
+            DeclareLaunchArgument(
+                'fov_mask_decay_frame', default_value='',
+                description='Frame the accumulation happens in. Empty derives '
+                            '<tf_prefix>/odom. Must be fixed with respect to the '
+                            'world -- never base_link or base_footprint'),
         ]
 
     def create_robot_state_nodes(self) -> List[Node]:
@@ -406,9 +417,10 @@ class Go2NodeFactory:
     def create_fov_mask_nodes(self, context) -> List[Node]:
         """Create the FOV mask node over the raw cloud.
 
-        Additive: publishes <raw_lidar_topic>_masked and leaves the unmasked
-        feed untouched, so both can be compared side by side. Nothing runs
-        unless fov_mask:=true.
+        Additive: publishes <raw_lidar_topic>_processed and leaves the
+        unmasked feed untouched, so the two can be compared side by side. That
+        one topic carries per-scan masked clouds, or the accumulated history
+        when fov_mask_decay is set. Nothing runs unless fov_mask:=true.
         """
         with_fov_mask = LaunchConfiguration('fov_mask', default='false')
 
@@ -430,6 +442,17 @@ class Go2NodeFactory:
         if mask_origin:
             overrides['mask_origin'] = mask_origin
 
+        # Accumulation must happen in a frame that does not ride the robot, so
+        # this derives odom rather than the base_footprint mask_frame default.
+        decay_frame = LaunchConfiguration('fov_mask_decay_frame').perform(context)
+        overrides['decay_frame'] = decay_frame or self.config.frame('odom')
+
+        # Resolved and cast here: the node declares decay_time as a double, and
+        # launch substitutions arrive as strings.
+        decay_time = LaunchConfiguration('fov_mask_decay').perform(context)
+        if decay_time:
+            overrides['decay_time'] = float(decay_time)
+
         return [
             Node(
                 package='lidar_processor',
@@ -440,7 +463,7 @@ class Go2NodeFactory:
                 parameters=[params_file, overrides],
                 remappings=[
                     ('cloud_in', raw_topic),
-                    ('cloud_masked', f'{raw_topic}_masked'),
+                    ('cloud_processed', f'{raw_topic}_processed'),
                 ],
             ),
         ]

@@ -97,6 +97,54 @@
     azim_min_deg: -180.0
     azim_max_deg: 180.0
 
+    # -- decay / accumulation -------------------------------------------------
+    # Accumulates points over time, like RViz2's Decay Time property. This
+    # switches what the single `cloud_processed` topic carries: per-scan masked
+    # clouds when 0, the accumulated history when set.
+    #
+    # 0 disables it, matching RViz where 0 means "show only the newest cloud".
+    #
+    # Leave it at 0 when feeding scan-to-map odometry such as KISS-ICP: it is
+    # sequential and deskews using the per-point time offsets, which are
+    # relative to their own sweep.
+    #
+    # cslam is more tolerant -- ScanContext bins by x,y and stores max(z+2.0),
+    # so sweep boundaries do not matter to it, and it was already consuming the
+    # Go2's accumulated WebRTC voxel map rather than per-sweep data. The catch
+    # is pose association: each keyframe carries one odometry pose, so a cloud
+    # spanning several poses yields a loop-closure transform that is not a
+    # transform between two robot poses.
+    # Both robots carry non-repetitive L2 scanners: each sweep covers only a
+    # fraction of the FOV and successive sweeps sample different directions, so
+    # one sweep is a sparse slice of the room rather than a picture of it.
+    # Accumulating is how a complete picture is formed -- normal operation for
+    # this sensor class, not a density optimisation.
+    #
+    # Same sensor on both robots, so this value is SHARED and should match:
+    # identical coverage-vs-time keeps the two clouds comparable. (Contrast
+    # sensor_blank_radius, which describes mount hardware and is per-robot.)
+    #
+    # Size it from the stats line -- raise until the accumulated point count
+    # stops growing, which is the sensor's coverage time. While moving, keep
+    # speed * decay_time below cslam's voxel_size (0.3 m) or the smear blurs
+    # the cells you were filling.
+    decay_time: 0.5
+
+    # The frame accumulation happens in. MUST be fixed with respect to the
+    # world -- odom or map, never base_link or base_footprint. Stacking scans
+    # in a frame that rides the robot piles every sweep at the current pose
+    # instead of sweeping out the room. Overridden per robot by the launch
+    # files, since the value carries each robot's tf_prefix.
+    #
+    # This is deliberately independent of mask_frame: the mask may legitimately
+    # be evaluated in a moving frame, accumulation may not.
+    decay_frame: odom
+
+    # Hard cap; oldest clouds are evicted first once it is reached. RViz has no
+    # equivalent because it is bounded by a render budget -- an unbounded buffer
+    # in a node would just grow.
+    decay_max_points: 2000000
+
     tf_timeout: 0.1
 
     # Retention reports every N seconds. These percentiles are what you tune

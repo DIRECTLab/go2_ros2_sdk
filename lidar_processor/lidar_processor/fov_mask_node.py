@@ -28,6 +28,7 @@ This node publishes no TF and does not modify the input topic.
 """
 
 import math
+from collections import deque
 from typing import Dict, Optional, Tuple
 
 import numpy as np
@@ -80,11 +81,22 @@ class FovMaskNode(Node):
         )
         # Topic names are deliberately generic and remapped at launch, matching
         # how this stack wires pointcloud_to_laserscan (cloud_in -> scan).
+        # One output topic carrying whichever form is configured: the per-scan
+        # masked cloud, or the accumulated one when decay_time is set. Exactly
+        # one of _publish/_accumulate runs per input cloud, so the two never
+        # interleave on the wire.
         self.publisher = self.create_publisher(
-            PointCloud2, 'cloud_masked', cloud_qos,
+            PointCloud2, 'cloud_processed', cloud_qos,
             qos_overriding_options=QoSOverridingOptions.with_default_policies())
         self.create_subscription(
             PointCloud2, 'cloud_in', self._on_cloud, cloud_qos)
+
+        # Accumulation buffer: (stamp_seconds, rows) oldest first, every row
+        # already rewritten into decay_frame so entries can simply be
+        # concatenated. A deque because pruning is always from the front.
+        self._decay_buf: deque = deque()
+        self._decay_points = 0
+        self._decay_layout: Optional[Tuple] = None
 
         # Rolling stats, reset each reporting window.
         self._msgs = 0
@@ -176,6 +188,35 @@ class FovMaskNode(Node):
                 ('azim_max_deg', 180.0, ParameterDescriptor(
                     description='Keep points at or below this yaw, in degrees.')),
 
+                # -- decay / accumulation --------------------------------------
+                ('decay_time', 0.0, ParameterDescriptor(
+                    description='Seconds of history to accumulate, like RViz2\'s '
+                                'Decay Time. Points older than this are dropped. '
+                                '0 disables accumulation entirely, matching RViz '
+                                'where 0 means "show only the newest cloud". '
+                                'Changes what cloud_processed carries: per-scan '
+                                'masked clouds when 0, the accumulated history when '
+                                'set. Leave it at 0 when feeding scan-to-map odometry '
+                                'such as KISS-ICP, which is sequential and deskews '
+                                'using the per-point time offsets. cslam tolerates '
+                                'accumulated clouds -- it was already fed the Go2 '
+                                "voxel map -- but ties one odometry pose to each "
+                                'keyframe, so a cloud spanning several poses makes '
+                                'the loop-closure transform not a pose-to-pose one.')),
+                ('decay_frame', 'odom', ParameterDescriptor(
+                    description='Frame the accumulation happens in. MUST be fixed '
+                                'with respect to the world -- odom or map, never '
+                                'base_link or base_footprint. Stacking scans in a '
+                                'frame that rides the robot piles every sweep at the '
+                                'current pose instead of sweeping out the room. '
+                                'Independent of mask_frame, which may legitimately be '
+                                'a moving frame.')),
+                ('decay_max_points', 2000000, ParameterDescriptor(
+                    description='Hard cap on accumulated points; the oldest clouds are '
+                                'evicted first once it is reached. RViz has no such '
+                                'cap because it is bounded by a render budget, but an '
+                                'unbounded buffer here would grow without limit.')),
+
                 ('tf_timeout', 0.1, ParameterDescriptor(
                     description='Seconds to wait for the TF lookup before falling '
                                 'back to the latest available transform.')),
@@ -203,6 +244,10 @@ class FovMaskNode(Node):
         self.elev_max = math.radians(get('elev_max_deg').get_parameter_value().double_value)
         self.azim_min = math.radians(get('azim_min_deg').get_parameter_value().double_value)
         self.azim_max = math.radians(get('azim_max_deg').get_parameter_value().double_value)
+        self.decay_time = get('decay_time').get_parameter_value().double_value
+        self.decay_frame = get('decay_frame').get_parameter_value().string_value
+        self.decay_max_points = get(
+            'decay_max_points').get_parameter_value().integer_value
         self.tf_timeout = get('tf_timeout').get_parameter_value().double_value
         self.stats_period = get('stats_period').get_parameter_value().double_value
 
@@ -270,8 +315,15 @@ class FovMaskNode(Node):
             self._points_out += int(keep.sum())
             self._last_retained = {k: v[keep] for k, v in metrics.items()}
 
-            self._publish(msg, payload, point_step, n_points, keep,
-                          masked_xyz, xyz_dtype)
+            # Either/or, never both: the accumulated cloud already contains
+            # this scan's surviving points, so publishing both would put the
+            # same points on the topic twice.
+            if self.decay_time > 0.0:
+                self._accumulate(msg, payload, point_step, n_points, keep,
+                                 xyz_dtype)
+            else:
+                self._publish(msg, payload, point_step, n_points, keep,
+                              masked_xyz, xyz_dtype)
 
         except Exception as exc:
             self.get_logger().error(f"Error masking cloud: {exc}",
@@ -430,6 +482,83 @@ class FovMaskNode(Node):
         out.data = kept_rows.tobytes()
         self.publisher.publish(out)
 
+    # -- accumulation ------------------------------------------------------
+
+    def _accumulate(self, msg: PointCloud2, payload: bytes, point_step: int,
+                    n_points: int, keep: np.ndarray,
+                    xyz_dtype: np.dtype) -> None:
+        """Buffer the surviving points and republish the decayed history.
+
+        Modelled on RViz2's Decay Time, with one difference forced by running
+        headless: RViz re-transforms its whole buffer into the fixed frame at
+        render time, so it can afford to store points in their original frames.
+        Here each cloud is rewritten into `decay_frame` once, on arrival, and
+        stored ready to concatenate.
+        """
+        # Concatenation demands one stride and one field layout across the
+        # buffer, so a publisher changing layout mid-run has to flush it.
+        layout = tuple((f.name, f.offset, f.datatype) for f in msg.fields) + (point_step,)
+        if self._decay_layout is not None and layout != self._decay_layout:
+            self.get_logger().warn(
+                "Cloud layout changed; flushing the decay buffer",
+                throttle_duration_sec=10.0)
+            self._decay_buf.clear()
+            self._decay_points = 0
+        self._decay_layout = layout
+
+        transform = self._lookup_transform(self.decay_frame, msg.header)
+        if transform is None:
+            return
+        rotation, translation = transform
+
+        rows = np.frombuffer(payload, dtype=np.uint8).reshape(n_points, point_step)
+        kept = rows[keep].copy()
+
+        if kept.shape[0]:
+            view = np.frombuffer(payload, dtype=xyz_dtype, count=n_points)
+            xyz = np.stack([view['x'], view['y'], view['z']], axis=1).astype(np.float64)
+            decayed = xyz[keep] @ rotation.T + translation
+            writable = kept.view(xyz_dtype).reshape(-1)
+            writable['x'] = decayed[:, 0]
+            writable['y'] = decayed[:, 1]
+            writable['z'] = decayed[:, 2]
+
+        stamp = Time.from_msg(msg.header.stamp).nanoseconds * 1e-9
+        self._decay_buf.append((stamp, kept))
+        self._decay_points += int(kept.shape[0])
+
+        # Age out. Compared against this cloud's own stamp rather than the wall
+        # clock, so the window follows the data -- which matters because the raw
+        # feed is stamped from the robot's clock, not this node's.
+        cutoff = stamp - self.decay_time
+        while self._decay_buf and self._decay_buf[0][0] < cutoff:
+            self._decay_points -= int(self._decay_buf.popleft()[1].shape[0])
+
+        # Then the hard cap, oldest first.
+        while self._decay_buf and self._decay_points > self.decay_max_points:
+            self._decay_points -= int(self._decay_buf.popleft()[1].shape[0])
+
+        if not self._decay_buf:
+            return
+
+        merged = (self._decay_buf[0][1] if len(self._decay_buf) == 1
+                  else np.concatenate([r for _, r in self._decay_buf], axis=0))
+
+        out = PointCloud2()
+        out.header.stamp = msg.header.stamp
+        # Always decay_frame, whatever publish_frame says: the accumulated cloud
+        # spans many sensor poses, so no single sensor frame describes it.
+        out.header.frame_id = self.decay_frame
+        out.height = 1
+        out.width = int(merged.shape[0])
+        out.fields = msg.fields
+        out.is_bigendian = msg.is_bigendian
+        out.point_step = point_step
+        out.row_step = point_step * out.width
+        out.is_dense = msg.is_dense
+        out.data = merged.tobytes()
+        self.publisher.publish(out)
+
     # -- diagnostics -------------------------------------------------------
 
     def _report_stats(self) -> None:
@@ -454,6 +583,10 @@ class FovMaskNode(Node):
                 line += f" | {label} 5/50/95: {p5:.2f}/{p50:.2f}/{p95:.2f}"
         else:
             line += " | nothing retained in the last cloud"
+
+        if self.decay_time > 0.0:
+            line += (f" | decay {self._decay_points} pts over "
+                     f"{len(self._decay_buf)} clouds")
 
         if self._dropped_msgs:
             line += f" | {self._dropped_msgs} dropped"
@@ -481,6 +614,12 @@ class FovMaskNode(Node):
         self.get_logger().info(
             f"   elevation: [{math.degrees(self.elev_min):.1f}, "
             f"{math.degrees(self.elev_max):.1f}] deg")
+        if self.decay_time > 0.0:
+            self.get_logger().info(
+                f"   decay: {self.decay_time:.2f} s in '{self.decay_frame}', "
+                f"cap {self.decay_max_points} pts -> cloud_processed")
+        else:
+            self.get_logger().info("   decay: <off> (cloud_processed is per-scan)")
         self.get_logger().info(
             f"   azimuth: [{math.degrees(self.azim_min):.1f}, "
             f"{math.degrees(self.azim_max):.1f}] deg")

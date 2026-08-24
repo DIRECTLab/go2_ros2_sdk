@@ -8,7 +8,18 @@ Lives in `lidar_processor`, not `go2_robot_sdk`, because **it has to run on the
 rover too**. `ganon` runs `unitree_lidar_ros2`; a mask built into
 `raw_lidar_node` could never touch it. One implementation, run once per robot.
 
-It is a pure filter: it publishes a second topic and leaves the input alone.
+It is a pure filter: it publishes its own topics and leaves the input alone. It
+can also accumulate points over time onto a third topic — see
+[Accumulation](#accumulation-decay_time) below.
+
+| topic | contents |
+|---|---|
+| `cloud_in` | input, remapped at launch |
+| `cloud_processed` | the result: one masked cloud per input scan, or the accumulated history when `decay_time` is set |
+
+One output topic, not two. `decay_time` changes what it carries rather than
+adding a second stream — consumers subscribe to one name and don't have to know
+how the node is configured.
 
 ## What this is for, and what it cannot do
 
@@ -98,6 +109,102 @@ legitimately per-robot — the Go2's factory head mount and the rover's L2 mast
 are different geometry. Override it with `-p sensor_blank_radius:=0.12` rather
 than forking the shared yaml.
 
+## Accumulation (`decay_time`)
+
+Modelled on RViz2's **Decay Time**: points persist for `decay_time` seconds
+instead of each scan replacing the last. `0` disables it, matching RViz where 0
+means "show only the newest cloud".
+
+Setting it **changes what `cloud_processed` carries**: per-scan masked clouds
+when 0, the accumulated history when set. The two never interleave — exactly one
+of them is published per input cloud, so the same points can't appear twice.
+
+> **Leave it at 0 when feeding scan-to-map odometry.** KISS-ICP and similar are
+> sequential and deskew using the per-point `time` offsets, which are relative
+> to their own sweep — an accumulated cloud breaks both assumptions.
+>
+> **cslam is more tolerant than that**, and it is worth being precise since the
+> two often get lumped together. ScanContext bins by x,y and stores
+> `max(z + 2.0)` per cell (§4), so sweep boundaries are irrelevant to the
+> descriptor, and FPFH/TEASER is plain cloud registration. cslam was in fact
+> already consuming the Go2's *accumulated* WebRTC voxel map rather than
+> per-sweep data. Two things do still bite:
+>
+> - **Pose association.** Each keyframe carries one odometry pose. A cloud
+>   spanning several poses makes the transform TEASER recovers not a transform
+>   between two robot poses.
+> - **Frame.** With accumulation on, the topic is published in `decay_frame`
+>   (odom), not the sensor frame, which changes what cslam's
+>   `sensor_base_frame_id` handling is reconciling — bug #11 territory.
+
+### Why this is not optional on these sensors
+
+Both robots carry Unitree L2s, which are **non-repetitive** scanners: each sweep
+covers only a fraction of the field of view, and successive sweeps deliberately
+sample *different* directions. That is the rosette pattern you see in RViz
+rather than a fixed lattice of rings.
+
+The consequence is that a single sweep is not a picture of the room — it is a
+sparse slice of it. Accumulating over `decay_time` is how a complete picture is
+formed, so this is part of normal operation for this sensor class, not a density
+optimisation layered on top.
+
+Because both robots run the same sensor, **`decay_time` belongs in the shared
+yaml and should be identical on both**. Same coverage-vs-time behaviour, same
+fraction of the FOV filled, so the two clouds stay directly comparable — which
+is the entire point of the shared file. Contrast `sensor_blank_radius`, which
+describes mount hardware and is legitimately per-robot.
+
+### Choosing a value
+
+The right value is the sensor's FOV coverage time, and the node already reports
+what you need to find it. Sweep `decay_time` upward and watch the stats line:
+
+```
+... | decay 41300 pts over 12 clouds
+```
+
+Raise it until the accumulated point count stops growing meaningfully and the
+scene stops filling in visually — that is the coverage time. Past that you are
+only adding age, and with it pose smear.
+
+**While moving, coverage and smear pull against each other.** Accumulating for
+`T` seconds at speed `v` smears the cloud by `v·T`; keep that under
+`voxel_size` or you blur the very cells you were filling. At 0.5 m/s with
+cslam's `voxel_size: 0.3` that is `T < 0.6 s`. Stationary there is no smear and
+you can integrate as long as you like.
+
+### `decay_frame` must be fixed with respect to the world
+
+Non-negotiable, and the reason accumulation can't just reuse `mask_frame`.
+`mask_frame` defaults to `base_footprint`, which **rides the robot** — stacking
+scans there piles every sweep on top of itself at the current pose and produces
+mush rather than a swept-out room. `decay_frame` defaults to `odom` and must
+name a frame that doesn't move: `odom` or `map`, never `base_link` or
+`base_footprint`.
+
+The two settings are independent on purpose: the mask may legitimately be
+evaluated in a moving frame, accumulation may not.
+
+For the same reason `cloud_processed` is **published in `decay_frame`** whenever
+accumulation is on, whatever `publish_frame` says. An accumulated cloud spans
+many sensor poses, so no single sensor frame describes it. With `decay_time: 0`
+the topic follows `publish_frame` as usual.
+
+### Bounds
+
+Age-out is measured against each **cloud's own header stamp**, not the wall
+clock, so the window follows the data — which matters because the raw feed is
+stamped from the robot's clock rather than this node's.
+
+`decay_max_points` (default 2,000,000) caps the buffer, evicting oldest-first.
+RViz needs no such cap because it's bounded by a render budget; an unbounded
+buffer in a node would simply grow. A publisher changing its field layout
+mid-run flushes the buffer, since concatenation needs one stride throughout.
+
+The mask runs **before** accumulation, so blanked and out-of-band points never
+enter the buffer.
+
 ## Two frame settings, and why they're separate
 
 `mask_frame` and `mask_origin` answer different questions, and conflating them
@@ -174,6 +281,9 @@ on each robot, which differs by prefix (`go2/base_footprint` vs
 | `sensor_blank_radius` | `0.0` | drop points within this euclidean radius of the **sensor** origin, for self-hit removal; `0` disables |
 | `elev_min_deg` / `elev_max_deg` | `-90` / `90` | elevation cone, measured from `mask_origin` |
 | `azim_min_deg` / `azim_max_deg` | `-180` / `180` | azimuth sector, wraps if min > max |
+| `decay_time` | `0.0` | seconds of history to accumulate; switches `cloud_processed` from per-scan to accumulated. `0` disables |
+| `decay_frame` | `odom` | frame accumulation happens in; **must be fixed w.r.t. the world** |
+| `decay_max_points` | `2000000` | hard cap on the buffer; oldest evicted first |
 | `tf_timeout` | `0.1` | seconds before falling back to the latest transform |
 | `stats_period` | `5.0` | seconds between retention reports; `0` disables |
 
@@ -182,7 +292,7 @@ subscription would silently receive nothing from either robot's lidar driver.
 
 ## Running it
 
-Topics are `cloud_in` and `cloud_masked`, remapped at launch — the same idiom
+Topics are `cloud_in` and `cloud_processed`, remapped at launch — the same idiom
 this stack uses for `pointcloud_to_laserscan` (`cloud_in` → `scan`).
 
 ### Alongside the Go2 stack
@@ -191,7 +301,7 @@ this stack uses for `pointcloud_to_laserscan` (`cloud_in` → `scan`).
 ros2 launch go2_robot_sdk robot.launch.py raw_lidar:=true raw_lidar_iface:=eth0 fov_mask:=true
 ```
 
-Publishes `/go2/raw_lidar_masked` alongside the untouched `/go2/raw_lidar`.
+Publishes `/go2/raw_lidar_processed` alongside the untouched `/go2/raw_lidar`.
 
 | argument | default | meaning |
 |---|---|---|
@@ -199,6 +309,8 @@ Publishes `/go2/raw_lidar_masked` alongside the untouched `/go2/raw_lidar`.
 | `fov_mask_params` | `config/fov_mask.yaml` | path to the shared mask yaml |
 | `fov_mask_frame` | `''` | mask axes / z datum; empty derives `<tf_prefix>/base_footprint` |
 | `fov_mask_origin` | `''` | measurement origin; empty keeps the yaml's value |
+| `fov_mask_decay` | `''` | seconds of history; empty keeps the yaml's value, `0` disables |
+| `fov_mask_decay_frame` | `''` | accumulation frame; empty derives `<tf_prefix>/odom` |
 
 Both frame arguments exist because their values carry each robot's `tf_prefix`
 and so cannot live in a yaml meant to be shared. For a datum that doesn't bob
@@ -208,10 +320,16 @@ with the gait:
 ros2 launch go2_robot_sdk robot.launch.py raw_lidar:=true raw_lidar_iface:=enP8p1s0 fov_mask:=true fov_mask_frame:=go2/odom
 ```
 
+To make that same topic carry 5 seconds of accumulated history instead:
+
+```bash
+ros2 launch go2_robot_sdk robot.launch.py raw_lidar:=true raw_lidar_iface:=enP8p1s0 fov_mask:=true fov_mask_decay:=5.0
+```
+
 ### Standalone, on either robot
 
 ```bash
-ros2 run lidar_processor fov_mask --ros-args --params-file /path/to/fov_mask.yaml -p mask_frame:=ganon/base_footprint -r cloud_in:=/ganon/unilidar/cloud -r cloud_masked:=/ganon/unilidar/cloud_masked
+ros2 run lidar_processor fov_mask --ros-args --params-file /path/to/fov_mask.yaml -p mask_frame:=ganon/base_footprint -r cloud_in:=/ganon/unilidar/cloud -r cloud_processed:=/ganon/unilidar/cloud_processed
 ```
 
 ### Feeding cslam
@@ -224,7 +342,7 @@ the right prefix, which was bug #11.
 ## Verifying
 
 ```bash
-ros2 topic hz /go2/raw_lidar_masked --qos-reliability best_effort
+ros2 topic hz /go2/raw_lidar_processed --qos-reliability best_effort
 ```
 
 If retention reads 0%, the usual causes are a `mask_frame` that doesn't exist
