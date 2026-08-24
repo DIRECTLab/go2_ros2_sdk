@@ -82,7 +82,7 @@
     # Tune it from the retention stats: raise it until the `sens_r` 5th
     # percentile clears your mount, then stop -- every extra centimetre is
     # real geometry thrown away.
-    sensor_blank_radius: 0.0
+    sensor_blank_radius: 0.68
 
     # -- elevation cone -------------------------------------------------------
     # Unbounded by default. Use this to emulate the cone one sensor physically
@@ -128,7 +128,7 @@
     # stops growing, which is the sensor's coverage time. While moving, keep
     # speed * decay_time below cslam's voxel_size (0.3 m) or the smear blurs
     # the cells you were filling.
-    decay_time: 0.5
+    decay_time: 1.0
 
     # The frame accumulation happens in. MUST be fixed with respect to the
     # world -- odom or map, never base_link or base_footprint. Stacking scans
