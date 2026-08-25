@@ -35,7 +35,10 @@ import numpy as np
 import rclpy
 from rclpy.duration import Duration
 from rclpy.node import Node
-from rclpy.qos import QoSProfile, QoSHistoryPolicy, QoSReliabilityPolicy
+from rclpy.callback_groups import MutuallyExclusiveCallbackGroup
+from rclpy.executors import MultiThreadedExecutor
+from rclpy.qos import (DurabilityPolicy, QoSProfile, QoSHistoryPolicy,
+                       QoSReliabilityPolicy)
 from rclpy.qos_overriding_options import QoSOverridingOptions
 from rclpy.time import Time
 from rcl_interfaces.msg import ParameterDescriptor
@@ -70,15 +73,24 @@ class FovMaskNode(Node):
         self._read_parameters()
 
         self.tf_buffer = Buffer()
-        # spin_thread=True is not optional here. Without it the listener's /tf
-        # subscription is serviced by the same single-threaded executor that
-        # runs _on_cloud -- which then blocks inside lookup_transform waiting
-        # for a transform that can only arrive if that executor is free to
-        # process it. The buffer falls further behind on every cloud, and the
-        # lookups fail with "only time T is in the buffer" for a T that keeps
-        # receding. An all-static chain still resolves, because static
-        # transforms are valid at any time, so the symptom looks selective.
-        self.tf_listener = TransformListener(self.tf_buffer, self, spin_thread=True)
+        # tf2's default /tf subscription is depth=100 KEEP_LAST RELIABLE. At a
+        # 20 Hz broadcaster that is five seconds of backlog, and reliable
+        # delivery means a consumer that falls behind works through the queue
+        # in order rather than jumping to the newest -- so a brief stall turns
+        # into a standing multi-second lag. A shallow queue bounds it: samples
+        # are dropped instead of accumulating, and TF interpolates the gaps.
+        #
+        # Not spin_thread=True: tf2 implements that by adding THIS node to a
+        # second executor, and a node can only belong to one, so it silently
+        # does nothing. The concurrency has to come from the executor instead.
+        self.tf_listener = TransformListener(
+            self.tf_buffer, self,
+            qos=QoSProfile(
+                depth=self.tf_queue_depth,
+                reliability=QoSReliabilityPolicy.RELIABLE,
+                durability=DurabilityPolicy.VOLATILE,
+                history=QoSHistoryPolicy.KEEP_LAST,
+            ))
 
         # BEST_EFFORT on both sides: it is what both robots' lidar drivers
         # publish, and a reliable subscription would silently receive nothing.
@@ -96,8 +108,18 @@ class FovMaskNode(Node):
         self.publisher = self.create_publisher(
             PointCloud2, 'cloud_processed', cloud_qos,
             qos_overriding_options=QoSOverridingOptions.with_default_policies())
+        # One group for our own callbacks, so the cloud handler and the stats
+        # timer stay mutually exclusive and every existing single-threaded
+        # assumption in this node still holds. tf2 puts /tf in its own
+        # ReentrantCallbackGroup, so under the MultiThreadedExecutor in main()
+        # transforms keep being ingested while a cloud is being processed --
+        # which is the whole point. Previously the ingestion could only run
+        # once the cloud callback returned, and the cloud callback was blocked
+        # waiting for the ingestion.
+        self._work_group = MutuallyExclusiveCallbackGroup()
         self.create_subscription(
-            PointCloud2, 'cloud_in', self._on_cloud, cloud_qos)
+            PointCloud2, 'cloud_in', self._on_cloud, cloud_qos,
+            callback_group=self._work_group)
 
         # Accumulation buffer: (stamp_seconds, rows) oldest first, every row
         # already rewritten into decay_frame so entries can simply be
@@ -127,7 +149,8 @@ class FovMaskNode(Node):
         self._log_configuration()
 
         if self.stats_period > 0.0:
-            self.create_timer(self.stats_period, self._report_stats)
+            self.create_timer(self.stats_period, self._report_stats,
+                              callback_group=self._work_group)
 
     # -- setup -------------------------------------------------------------
 
@@ -255,6 +278,13 @@ class FovMaskNode(Node):
                                 'moved in the gap -- set false to drop instead. '
                                 'Either way the gap is warned about and counted.')),
 
+                ('tf_queue_depth', 10, ParameterDescriptor(
+                    description='Subscription queue depth for /tf. tf2 defaults to '
+                                '100, which at a 20 Hz broadcaster is five seconds of '
+                                'backlog that a lagging consumer must work through in '
+                                'order. A shallow queue drops stale samples instead, '
+                                'keeping the buffer current; TF interpolates the '
+                                'gaps. Raise it if transforms arrive in large bursts.')),
                 ('tf_timeout', 0.1, ParameterDescriptor(
                     description='Seconds to wait for the TF lookup before falling '
                                 'back to the latest available transform.')),
@@ -286,6 +316,7 @@ class FovMaskNode(Node):
         self.decay_frame = get('decay_frame').get_parameter_value().string_value
         self.decay_max_points = get(
             'decay_max_points').get_parameter_value().integer_value
+        self.tf_queue_depth = get('tf_queue_depth').get_parameter_value().integer_value
         self.deskew = get('deskew').get_parameter_value().bool_value
         self.tf_allow_stale = get('tf_allow_stale').get_parameter_value().bool_value
         self.tf_timeout = get('tf_timeout').get_parameter_value().double_value
@@ -857,7 +888,13 @@ def main(args=None):
     node = None
     try:
         node = FovMaskNode()
-        rclpy.spin(node)
+        # MultiThreadedExecutor so tf2's ReentrantCallbackGroup can actually
+        # deliver /tf while a cloud is in flight. Under rclpy.spin() there is
+        # one thread, so the group buys nothing and lookups deadlock against
+        # the very ingestion they are waiting for.
+        executor = MultiThreadedExecutor()
+        executor.add_node(node)
+        executor.spin()
     except KeyboardInterrupt:
         pass
     except Exception as e:

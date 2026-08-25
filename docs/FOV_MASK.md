@@ -202,6 +202,36 @@ usable `time` field or an endpoint transform is missing. It applies only to the
 accumulation path: `mask_frame` may be a moving frame, so deskewing into it is
 ill-defined, whereas `decay_frame` is fixed by requirement.
 
+### Threading, and why `/tf` starves
+
+This node does TF lookups **inside** its cloud callback, which makes the
+executor arrangement load-bearing rather than incidental.
+
+Under `rclpy.spin()` there is one thread. The cloud callback blocks in
+`lookup_transform` waiting for a transform that can only arrive if that same
+thread is free to process `/tf` — so it can't, the buffer falls further behind
+on every cloud, and lookups fail with *"only time T is in the buffer"* for a T
+that keeps receding. An all-static chain still resolves, since static transforms
+are valid at any time, so the symptom looks selective: the mask lookup works and
+only the one crossing a dynamic edge fails.
+
+tf2 already puts `/tf` in a `ReentrantCallbackGroup` for exactly this reason,
+but that buys nothing without a **`MultiThreadedExecutor`**, which `main()` now
+uses. The cloud callback and the stats timer share one
+`MutuallyExclusiveCallbackGroup`, so they never overlap each other and every
+single-threaded assumption about the decay buffer still holds; only `/tf`
+ingestion runs concurrently.
+
+> `TransformListener(..., spin_thread=True)` looks like the fix and is not: tf2
+> implements it by adding *this* node to a second executor, and a node can only
+> belong to one, so it silently does nothing.
+
+`tf_queue_depth` is the other half. tf2 subscribes to `/tf` at depth **100**,
+which at a 20 Hz broadcaster is five seconds of backlog — and `/tf` is RELIABLE,
+so a lagging consumer works through the queue in order rather than jumping to
+the newest. That converts a momentary stall into a permanent offset. A shallow
+queue drops stale samples instead and TF interpolates the gaps.
+
 ### Stale transforms and clock skew (`tf_allow_stale`)
 
 When no transform exists at a cloud's stamp, the node uses the latest available
@@ -335,6 +365,7 @@ on each robot, which differs by prefix (`go2/base_footprint` vs
 | `decay_max_points` | `2000000` | hard cap on the buffer; oldest evicted first |
 | `deskew` | `true` | interpolate the transform across each sweep using per-point `time`; falls back to one transform per sweep when unavailable |
 | `tf_allow_stale` | `true` | use the latest transform when none exists at the cloud's stamp; `false` drops the cloud instead |
+| `tf_queue_depth` | `10` | `/tf` subscription depth; tf2's default of 100 lets a multi-second backlog build |
 | `tf_timeout` | `0.1` | seconds before falling back to the latest transform |
 | `stats_period` | `5.0` | seconds between retention reports; `0` disables |
 

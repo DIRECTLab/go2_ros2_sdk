@@ -170,6 +170,14 @@
     # from this machine's. Fix that before trusting any accumulated output.
     tf_allow_stale: true
 
+    # Subscription queue depth for /tf. tf2 defaults to 100, which at a 20 Hz
+    # broadcaster is five seconds of backlog -- and because /tf is RELIABLE, a
+    # consumer that falls behind works through that queue in order instead of
+    # jumping to the newest, turning a brief stall into a standing multi-second
+    # lag. A shallow queue drops stale samples instead; TF interpolates the
+    # gaps. Raise it if transforms genuinely arrive in large bursts.
+    tf_queue_depth: 10
+
     tf_timeout: 0.1
 
     # Retention reports every N seconds. These percentiles are what you tune
