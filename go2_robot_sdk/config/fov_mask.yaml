@@ -145,6 +145,31 @@
     # in a node would just grow.
     decay_max_points: 2000000
 
+    # -- motion compensation --------------------------------------------------
+    # One transform per sweep smears the cloud by however far the robot moved
+    # during it. Rotation dominates and the error scales with RANGE, so it hits
+    # exactly the distant returns that carry the distinctive geometry:
+    # at 0.5 rad/s over a 0.1 s sweep, a point at 5 m is displaced 0.25 m --
+    # about one cslam voxel. Accumulating N sweeps stacks N such errors; they
+    # do not cancel.
+    #
+    # With this on, the transform is sampled at sweep start and sweep end and
+    # interpolated per point using the offsets the sensor already reports.
+    # Falls back to a single transform, counted in the stats, when a cloud has
+    # no usable time field.
+    deskew: true
+
+    # When no transform exists at the cloud's stamp, use the latest available
+    # one rather than dropping the cloud. Convenient, but for accumulation it
+    # silently misplaces WHOLE clouds by however far the robot moved in the gap,
+    # which is far worse than intra-sweep smear. Either way the gap is warned
+    # about and counted as `TF stale xN, last skew +X.XXXs` in the stats.
+    #
+    # A large and steady skew is the signature of a clock-domain mismatch: the
+    # raw lidar feed is stamped from the robot's clock while odom is stamped
+    # from this machine's. Fix that before trusting any accumulated output.
+    tf_allow_stale: true
+
     tf_timeout: 0.1
 
     # Retention reports every N seconds. These percentiles are what you tune

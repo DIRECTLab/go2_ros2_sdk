@@ -174,6 +174,55 @@ only adding age, and with it pose smear.
 cslam's `voxel_size: 0.3` that is `T < 0.6 s`. Stationary there is no smear and
 you can integrate as long as you like.
 
+### Motion compensation (`deskew`)
+
+Accumulation transforms points into `decay_frame`, and **which instant you
+transform them at matters**. One transform per sweep smears the cloud by however
+far the robot moved during it.
+
+Rotation dominates, and the error **scales with range**:
+
+| | displacement |
+|---|---|
+| translation at 0.5 m/s over a 0.1 s sweep | 0.05 m |
+| rotation at 0.5 rad/s over a 0.1 s sweep, at 5 m | **0.25 m** |
+
+0.25 m is about one cslam voxel, and it lands on precisely the distant returns
+that ScanContext's outer rings and FPFH's descriptors depend on. Accumulating
+N sweeps stacks N such errors, and they do not cancel.
+
+With `deskew: true` (the default) the transform is sampled at sweep start and
+sweep end and interpolated per point — SLERP on rotation, lerp on translation —
+using the per-point `time` offsets the sensor already reports and this node
+already preserves byte-exact. Measured on a synthetic rotating sweep, this takes
+the smear from the analytic 0.250 m to below 10⁻⁴ m.
+
+It falls back to a single transform, counted in the stats, when a cloud has no
+usable `time` field or an endpoint transform is missing. It applies only to the
+accumulation path: `mask_frame` may be a moving frame, so deskewing into it is
+ill-defined, whereas `decay_frame` is fixed by requirement.
+
+### Stale transforms and clock skew (`tf_allow_stale`)
+
+When no transform exists at a cloud's stamp, the node uses the latest available
+one. That is harmless for a static edge and **systematically wrong for a moving
+one** — the whole cloud lands wherever the robot was at the transform's time,
+which dwarfs any intra-sweep smear.
+
+It is now warned about and counted:
+
+```
+... | TF stale x37, last skew +0.412s
+```
+
+**A large, steady skew means a clock-domain mismatch, not TF lag.** The raw
+lidar feed is stamped from the robot's own clock (`stamp_source: raw` uses the
+DDS header stamp), while `odom` is stamped from this machine's ROS clock. If
+those clocks are not disciplined together, every lookup misses and every cloud
+is placed with a stale transform. Check that first — no amount of deskewing
+fixes it. Set `tf_allow_stale: false` to drop such clouds instead of
+misplacing them.
+
 ### `decay_frame` must be fixed with respect to the world
 
 Non-negotiable, and the reason accumulation can't just reuse `mask_frame`.
@@ -284,6 +333,8 @@ on each robot, which differs by prefix (`go2/base_footprint` vs
 | `decay_time` | `0.0` | seconds of history to accumulate; switches `cloud_processed` from per-scan to accumulated. `0` disables |
 | `decay_frame` | `odom` | frame accumulation happens in; **must be fixed w.r.t. the world** |
 | `decay_max_points` | `2000000` | hard cap on the buffer; oldest evicted first |
+| `deskew` | `true` | interpolate the transform across each sweep using per-point `time`; falls back to one transform per sweep when unavailable |
+| `tf_allow_stale` | `true` | use the latest transform when none exists at the cloud's stamp; `false` drops the cloud instead |
 | `tf_timeout` | `0.1` | seconds before falling back to the latest transform |
 | `stats_period` | `5.0` | seconds between retention reports; `0` disables |
 
@@ -298,14 +349,14 @@ this stack uses for `pointcloud_to_laserscan` (`cloud_in` → `scan`).
 ### Alongside the Go2 stack
 
 ```bash
-ros2 launch go2_robot_sdk robot.launch.py raw_lidar:=true raw_lidar_iface:=eth0 fov_mask:=true
+ros2 launch go2_robot_sdk robot.launch.py
 ```
 
 Publishes `/go2/raw_lidar_processed` alongside the untouched `/go2/raw_lidar`.
 
 | argument | default | meaning |
 |---|---|---|
-| `fov_mask` | `false` | enable the node |
+| `fov_mask` | `true` | run the node; `false` leaves it out. Requires `raw_lidar`, which supplies its input |
 | `fov_mask_params` | `config/fov_mask.yaml` | path to the shared mask yaml |
 | `fov_mask_frame` | `''` | mask axes / z datum; empty derives `<tf_prefix>/base_footprint` |
 | `fov_mask_origin` | `''` | measurement origin; empty keeps the yaml's value |
@@ -317,13 +368,13 @@ and so cannot live in a yaml meant to be shared. For a datum that doesn't bob
 with the gait:
 
 ```bash
-ros2 launch go2_robot_sdk robot.launch.py raw_lidar:=true raw_lidar_iface:=enP8p1s0 fov_mask:=true fov_mask_frame:=go2/odom
+ros2 launch go2_robot_sdk robot.launch.py fov_mask_frame:=go2/odom
 ```
 
 To make that same topic carry 5 seconds of accumulated history instead:
 
 ```bash
-ros2 launch go2_robot_sdk robot.launch.py raw_lidar:=true raw_lidar_iface:=enP8p1s0 fov_mask:=true fov_mask_decay:=5.0
+ros2 launch go2_robot_sdk robot.launch.py fov_mask_decay:=5.0
 ```
 
 ### Standalone, on either robot

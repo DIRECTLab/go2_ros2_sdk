@@ -109,12 +109,14 @@ class RawLidarNode(Node):
         self.declare_parameters(
             namespace='',
             parameters=[
-                ('network_interface', '', ParameterDescriptor(
-                    description='Ethernet interface facing the robot, e.g. "eth0". '
-                                'Empty does NOT mean "all interfaces" -- it lets '
+                ('network_interface', 'enP8p1s0', ParameterDescriptor(
+                    description='Ethernet interface facing the robot. Defaults to the '
+                                "Jetson's onboard NIC; set it explicitly on any other "
+                                'host. Empty does NOT mean "all interfaces" -- it lets '
                                 'CycloneDDS pick one by its own heuristic, which '
                                 'chooses wrong on any machine that also has Wi-Fi. '
-                                'Set this explicitly.')),
+                                'The interface must be up and hold an address on the '
+                                'robot subnet or CycloneDDS rejects it by name.')),
                 ('dds_domain_id', 0, ParameterDescriptor(
                     description='CycloneDDS domain id the robot publishes on.')),
                 ('dds_topic', 'rt/utlidar/cloud', ParameterDescriptor(

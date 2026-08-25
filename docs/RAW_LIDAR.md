@@ -5,7 +5,8 @@ Publishes the robot's onboard L2 lidar feed — taken straight off the
 `sensor_msgs/PointCloud2`.
 
 This is **additive**. Nothing about the driver's existing WebRTC point cloud
-(`/go2/point_cloud2`) changes, and the node is off by default in the launch file.
+(`/go2/point_cloud2`) changes. The node is **on by default** in the launch file;
+pass `raw_lidar:=false` to leave it out.
 
 ## Why this exists rather than reusing the WebRTC path
 
@@ -163,7 +164,7 @@ misconfigured frame.
 
 | parameter | default | meaning |
 |---|---|---|
-| `network_interface` | `''` | Ethernet interface facing the robot, e.g. `eth0`. **Set this.** Empty does *not* mean "all interfaces" — it lets CycloneDDS pick one by its own heuristic, which chooses wrong on any machine that also has Wi-Fi |
+| `network_interface` | `enP8p1s0` | Ethernet interface facing the robot; the Jetson's onboard NIC. **Set it explicitly on any other host.** Empty does *not* mean "all interfaces" — it lets CycloneDDS pick one by its own heuristic, which chooses wrong on any machine that also has Wi-Fi |
 | `dds_domain_id` | `0` | CycloneDDS domain the robot publishes on |
 | `dds_topic` | `rt/utlidar/cloud` | DDS topic to subscribe to |
 | `output_topic` | `raw_lidar` | ROS2 topic. Relative takes the node namespace; absolute (e.g. `/r0/raw_lidar`) overrides it |
@@ -198,18 +199,24 @@ ros2 run go2_robot_sdk raw_lidar_node --ros-args -p network_interface:=eth0 -p f
 
 ### Alongside the rest of the stack
 
-`robot.launch.py` carries it, gated off by default:
+`robot.launch.py` runs it by default, so the plain bringup already publishes it:
 
 ```bash
-ros2 launch go2_robot_sdk robot.launch.py raw_lidar:=true raw_lidar_iface:=eth0
+ros2 launch go2_robot_sdk robot.launch.py
+```
+
+On a host whose interface is not the Jetson's, or to leave it out entirely:
+
+```bash
+ros2 launch go2_robot_sdk robot.launch.py raw_lidar_iface:=eth0
 ```
 
 Launch arguments:
 
 | argument | default | meaning |
 |---|---|---|
-| `raw_lidar` | `false` | enable the node |
-| `raw_lidar_iface` | `$GO2_LIDAR_IFACE` or `''` | network interface |
+| `raw_lidar` | `true` | run the node; `false` leaves it out |
+| `raw_lidar_iface` | `$GO2_LIDAR_IFACE` or `enP8p1s0` | network interface, defaulting to the Jetson's |
 | `raw_lidar_domain` | `0` | DDS domain id |
 | `raw_lidar_topic` | `raw_lidar` | resolves to `/go2/raw_lidar` under this launch file's `PushRosNamespace('go2')` |
 | `raw_lidar_frame` | `''` | empty derives `<tf_prefix>/radar` |
@@ -221,7 +228,7 @@ cslam expects each robot's sensor data under `/r{robot_id}/`. Pass an absolute
 topic, which bypasses the `/go2` namespace push:
 
 ```bash
-ros2 launch go2_robot_sdk robot.launch.py raw_lidar:=true raw_lidar_iface:=eth0 raw_lidar_topic:=/r1/raw_lidar
+ros2 launch go2_robot_sdk robot.launch.py raw_lidar_topic:=/r1/raw_lidar
 ```
 
 or standalone:
@@ -314,4 +321,4 @@ installed version's `unitree_sdk2py/idl/sensor_msgs/` tree.
 |---|---|
 | `go2_robot_sdk/infrastructure/dds/utlidar_cloud_subscriber.py` | ROS-free DDS adapter: channel factory, subscriber, message-shape helpers, confirmed layout constant |
 | `go2_robot_sdk/presentation/raw_lidar_node.py` | the `rclpy` node |
-| `launch/robot.launch.py` | `create_raw_lidar_nodes()`, gated on `raw_lidar:=true` |
+| `launch/robot.launch.py` | `create_raw_lidar_nodes()`, on by default, disable with `raw_lidar:=false` |

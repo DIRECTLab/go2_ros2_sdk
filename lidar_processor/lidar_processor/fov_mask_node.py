@@ -97,6 +97,16 @@ class FovMaskNode(Node):
         self._decay_buf: deque = deque()
         self._decay_points = 0
         self._decay_layout: Optional[Tuple] = None
+        self._time_dtype_cache: Dict[Tuple, Optional[np.dtype]] = {}
+
+        # TF staleness diagnostics. The cloud stamp and the TF stamp can come
+        # from different clocks -- the raw lidar feed is stamped from the
+        # robot's clock while odom is stamped from this machine's -- and the
+        # resulting skew is invisible unless it is measured.
+        self._tf_stale = 0
+        self._tf_skew_last: Optional[float] = None
+        self._deskewed = 0
+        self._deskew_failed = 0
 
         # Rolling stats, reset each reporting window.
         self._msgs = 0
@@ -217,6 +227,26 @@ class FovMaskNode(Node):
                                 'cap because it is bounded by a render budget, but an '
                                 'unbounded buffer here would grow without limit.')),
 
+                ('deskew', True, ParameterDescriptor(
+                    description='Motion-compensate each sweep using its per-point '
+                                'time offsets: the transform is looked up at sweep '
+                                'start and sweep end and interpolated per point, '
+                                'instead of one transform for the whole sweep. '
+                                'Intra-sweep smear is dominated by rotation and '
+                                'scales with range, so it hits exactly the distant '
+                                'returns that carry the distinctive geometry. Falls '
+                                'back to a single transform when the cloud has no '
+                                'usable time field. Only applies to the accumulation '
+                                'path, which is the only one with a frame fixed '
+                                'enough to deskew into.')),
+                ('tf_allow_stale', True, ParameterDescriptor(
+                    description='When no transform exists at the cloud\'s stamp, use '
+                                'the latest available one instead of dropping the '
+                                'cloud. Convenient, but for accumulation it silently '
+                                'misplaces whole clouds by however far the robot '
+                                'moved in the gap -- set false to drop instead. '
+                                'Either way the gap is warned about and counted.')),
+
                 ('tf_timeout', 0.1, ParameterDescriptor(
                     description='Seconds to wait for the TF lookup before falling '
                                 'back to the latest available transform.')),
@@ -248,6 +278,8 @@ class FovMaskNode(Node):
         self.decay_frame = get('decay_frame').get_parameter_value().string_value
         self.decay_max_points = get(
             'decay_max_points').get_parameter_value().integer_value
+        self.deskew = get('deskew').get_parameter_value().bool_value
+        self.tf_allow_stale = get('tf_allow_stale').get_parameter_value().bool_value
         self.tf_timeout = get('tf_timeout').get_parameter_value().double_value
         self.stats_period = get('stats_period').get_parameter_value().double_value
 
@@ -368,9 +400,12 @@ class FovMaskNode(Node):
                 target, source, Time.from_msg(header.stamp),
                 timeout=Duration(seconds=self.tf_timeout))
         except TransformException:
-            # Falling back to the latest available transform. Correct for the
-            # static sensor->base edge; a small lag on a dynamic one, which
-            # beats dropping the scan outright.
+            if not self.tf_allow_stale:
+                self._tf_stale += 1
+                self.get_logger().warn(
+                    f"No TF {target} <- {source} at the cloud stamp; dropping the "
+                    f"cloud (tf_allow_stale is false)", throttle_duration_sec=10.0)
+                return None
             try:
                 tf = self.tf_buffer.lookup_transform(target, source, Time())
             except TransformException as exc:
@@ -378,6 +413,20 @@ class FovMaskNode(Node):
                     f"TF {target} <- {source} unavailable: {exc}",
                     throttle_duration_sec=10.0)
                 return None
+
+            # Using a transform from a different instant than the cloud. Fine
+            # for a static edge, systematically wrong for a moving one -- the
+            # whole cloud lands wherever the robot was at the transform's time.
+            self._tf_stale += 1
+            skew = (Time.from_msg(header.stamp).nanoseconds
+                    - Time.from_msg(tf.header.stamp).nanoseconds) * 1e-9
+            self._tf_skew_last = skew
+            self.get_logger().warn(
+                f"No TF {target} <- {source} at the cloud stamp; falling back to "
+                f"one {skew:+.3f} s away. A large, steady skew means the cloud and "
+                f"the transform are stamped from different clocks -- check "
+                f"stamp_source on the lidar driver against what stamps odom.",
+                throttle_duration_sec=5.0)
 
         t = tf.transform.translation
         q = tf.transform.rotation
@@ -484,6 +533,89 @@ class FovMaskNode(Node):
 
     # -- accumulation ------------------------------------------------------
 
+    def _time_dtype(self, msg: PointCloud2, point_step: int) -> Optional[np.dtype]:
+        """Structured dtype exposing just the per-point time column, or None.
+
+        Read from the message's own descriptors like _xyz_dtype, since the two
+        robots' feeds do not necessarily agree on where `time` sits.
+        """
+        key = tuple((f.name, f.offset, f.datatype) for f in msg.fields) + (point_step,)
+        if key in self._time_dtype_cache:
+            return self._time_dtype_cache[key]
+
+        dtype = None
+        for field in msg.fields:
+            if field.name != 'time':
+                continue
+            numpy_type = _POINTFIELD_NUMPY.get(int(field.datatype))
+            if numpy_type is None:
+                break
+            dtype = np.dtype({'names': ['time'], 'formats': ['<' + numpy_type],
+                              'offsets': [int(field.offset)], 'itemsize': point_step})
+            break
+
+        self._time_dtype_cache[key] = dtype
+        return dtype
+
+    def _lookup_pose(self, target: str, source: str, stamp) -> Optional[Tuple]:
+        """(quaternion xyzw, translation) at an exact stamp, or None."""
+        try:
+            tf = self.tf_buffer.lookup_transform(
+                target, source, stamp, timeout=Duration(seconds=self.tf_timeout))
+        except TransformException:
+            return None
+        q, t = tf.transform.rotation, tf.transform.translation
+        return (np.array([q.x, q.y, q.z, q.w]), np.array([t.x, t.y, t.z]))
+
+    def _deskew(self, msg: PointCloud2, payload: bytes, point_step: int,
+                n_points: int, keep: np.ndarray,
+                xyz_kept: np.ndarray) -> Optional[np.ndarray]:
+        """Per-point motion compensation. Returns points in decay_frame, or None.
+
+        One transform for a whole sweep smears the cloud by however far the
+        robot moved during it. Rotation dominates and the error scales with
+        range, so it corrupts the distant returns that carry the most
+        distinctive geometry. Here the transform is sampled at sweep start and
+        sweep end and interpolated per point using the offsets the sensor
+        already provides.
+
+        Returns None whenever the sweep cannot be interpolated -- no time
+        field, zero-width sweep, or a missing endpoint transform -- and the
+        caller falls back to the single-transform path.
+        """
+        time_dtype = self._time_dtype(msg, point_step)
+        if time_dtype is None:
+            return None
+
+        times = np.frombuffer(payload, dtype=time_dtype, count=n_points)['time']
+        finite = times[np.isfinite(times)]
+        if finite.size == 0:
+            return None
+        t_min, t_max = float(finite.min()), float(finite.max())
+        span = t_max - t_min
+        if span <= 0.0:
+            return None  # single-instant cloud; nothing to compensate
+
+        # header.stamp is the instant of the earliest point when the driver
+        # runs stamp_source 'raw'. Under the other stamp sources it is offset
+        # by a constant, which shifts the sweep as a whole but leaves the
+        # relative interpolation -- the part that removes the smear -- intact.
+        start = Time.from_msg(msg.header.stamp)
+        end = start + Duration(seconds=span)
+
+        pose0 = self._lookup_pose(self.decay_frame, msg.header.frame_id, start)
+        pose1 = self._lookup_pose(self.decay_frame, msg.header.frame_id, end)
+        if pose0 is None or pose1 is None:
+            return None
+
+        q0, t0 = pose0
+        q1, t1 = pose1
+        alpha = np.clip((times[keep].astype(np.float64) - t_min) / span, 0.0, 1.0)
+
+        rotations = _quats_to_matrices(_slerp(q0, q1, alpha))
+        translations = t0[None, :] + alpha[:, None] * (t1 - t0)[None, :]
+        return np.einsum('nij,nj->ni', rotations, xyz_kept) + translations
+
     def _accumulate(self, msg: PointCloud2, payload: bytes, point_step: int,
                     n_points: int, keep: np.ndarray,
                     xyz_dtype: np.dtype) -> None:
@@ -517,7 +649,22 @@ class FovMaskNode(Node):
         if kept.shape[0]:
             view = np.frombuffer(payload, dtype=xyz_dtype, count=n_points)
             xyz = np.stack([view['x'], view['y'], view['z']], axis=1).astype(np.float64)
-            decayed = xyz[keep] @ rotation.T + translation
+            xyz_kept = xyz[keep]
+
+            decayed = None
+            if self.deskew:
+                decayed = self._deskew(msg, payload, point_step, n_points,
+                                       keep, xyz_kept)
+                if decayed is None:
+                    self._deskew_failed += 1
+                else:
+                    self._deskewed += 1
+
+            if decayed is None:
+                # One transform for the whole sweep. Leaves intra-sweep smear
+                # in, which is what deskewing exists to remove.
+                decayed = xyz_kept @ rotation.T + translation
+
             writable = kept.view(xyz_dtype).reshape(-1)
             writable['x'] = decayed[:, 0]
             writable['y'] = decayed[:, 1]
@@ -587,12 +734,20 @@ class FovMaskNode(Node):
         if self.decay_time > 0.0:
             line += (f" | decay {self._decay_points} pts over "
                      f"{len(self._decay_buf)} clouds")
+            if self.deskew:
+                line += f" | deskew {self._deskewed} ok/{self._deskew_failed} fell back"
+
+        if self._tf_stale:
+            skew = ('' if self._tf_skew_last is None
+                    else f", last skew {self._tf_skew_last:+.3f}s")
+            line += f" | TF stale x{self._tf_stale}{skew}"
 
         if self._dropped_msgs:
             line += f" | {self._dropped_msgs} dropped"
 
         self.get_logger().info(line)
         self._msgs = self._points_in = self._points_out = self._dropped_msgs = 0
+        self._tf_stale = self._deskewed = self._deskew_failed = 0
 
     def _log_configuration(self) -> None:
         def unbounded(v):
@@ -618,11 +773,52 @@ class FovMaskNode(Node):
             self.get_logger().info(
                 f"   decay: {self.decay_time:.2f} s in '{self.decay_frame}', "
                 f"cap {self.decay_max_points} pts -> cloud_processed")
+            self.get_logger().info(
+                f"   deskew: {'on' if self.deskew else 'off'}"
+                f" | stale TF: {'allowed' if self.tf_allow_stale else 'dropped'}")
         else:
             self.get_logger().info("   decay: <off> (cloud_processed is per-scan)")
         self.get_logger().info(
             f"   azimuth: [{math.degrees(self.azim_min):.1f}, "
             f"{math.degrees(self.azim_max):.1f}] deg")
+
+
+def _slerp(q0: np.ndarray, q1: np.ndarray, alpha: np.ndarray) -> np.ndarray:
+    """Vectorised SLERP between two xyzw quaternions. Returns (N, 4)."""
+    dot = float(np.dot(q0, q1))
+    if dot < 0.0:
+        # Quaternions double-cover rotations; flip so the interpolation takes
+        # the short way round instead of spinning nearly all the way about.
+        q1 = -q1
+        dot = -dot
+    if dot > 0.9995:
+        # Nearly parallel: SLERP is numerically unstable here and lerp is
+        # indistinguishable at these angles.
+        q = q0[None, :] + alpha[:, None] * (q1 - q0)[None, :]
+    else:
+        theta = math.acos(max(-1.0, min(1.0, dot)))
+        q = (np.sin((1.0 - alpha) * theta)[:, None] * q0[None, :]
+             + np.sin(alpha * theta)[:, None] * q1[None, :]) / math.sin(theta)
+    return q / np.linalg.norm(q, axis=1, keepdims=True)
+
+
+def _quats_to_matrices(q: np.ndarray) -> np.ndarray:
+    """(N, 4) xyzw -> (N, 3, 3). Assumes unit quaternions, as _slerp returns."""
+    x, y, z, w = q[:, 0], q[:, 1], q[:, 2], q[:, 3]
+    xx, yy, zz = x * x, y * y, z * z
+    xy, xz, yz = x * y, x * z, y * z
+    wx, wy, wz = w * x, w * y, w * z
+    m = np.empty((q.shape[0], 3, 3))
+    m[:, 0, 0] = 1 - 2 * (yy + zz)
+    m[:, 0, 1] = 2 * (xy - wz)
+    m[:, 0, 2] = 2 * (xz + wy)
+    m[:, 1, 0] = 2 * (xy + wz)
+    m[:, 1, 1] = 1 - 2 * (xx + zz)
+    m[:, 1, 2] = 2 * (yz - wx)
+    m[:, 2, 0] = 2 * (xz - wy)
+    m[:, 2, 1] = 2 * (yz + wx)
+    m[:, 2, 2] = 1 - 2 * (xx + yy)
+    return m
 
 
 def _quat_to_matrix(x: float, y: float, z: float, w: float) -> np.ndarray:

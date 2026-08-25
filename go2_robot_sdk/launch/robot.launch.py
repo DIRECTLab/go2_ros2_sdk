@@ -156,16 +156,22 @@ class Go2NodeFactory:
                 'tf_prefix', default_value='go2',
                 description='Prefix applied to every TF frame this robot publishes, '
                             'e.g. "go2" yields go2/odom -> go2/base_link'),
-            # Raw lidar over CycloneDDS/Ethernet. Off by default: it is an
-            # additional feed alongside the driver's WebRTC point_cloud2, not a
-            # replacement, and it needs unitree_sdk2py plus a cabled link.
+            # Raw lidar over CycloneDDS/Ethernet. On by default: it is the feed
+            # the SLAM stack actually consumes. Still additive -- the driver's
+            # WebRTC point_cloud2 is unaffected. Needs unitree_sdk2py and a
+            # cabled link on the robot's subnet; without them the node logs the
+            # failure and exits, leaving the rest of the stack running.
             DeclareLaunchArgument(
-                'raw_lidar', default_value='false',
+                'raw_lidar', default_value='true',
                 description='Publish the raw rt/utlidar/cloud feed over CycloneDDS'),
             DeclareLaunchArgument(
-                'raw_lidar_iface', default_value=os.getenv('GO2_LIDAR_IFACE', ''),
-                description='Ethernet interface facing the robot, e.g. "eth0". '
-                            'Empty means every interface'),
+                'raw_lidar_iface',
+                default_value=os.getenv('GO2_LIDAR_IFACE', 'enP8p1s0'),
+                description='Ethernet interface facing the robot. Defaults to the '
+                            "Jetson's onboard NIC; override with the GO2_LIDAR_IFACE "
+                            'environment variable or this argument on other hosts. '
+                            'Must be up and hold an address on the robot subnet -- '
+                            'CycloneDDS rejects it otherwise'),
             DeclareLaunchArgument(
                 'raw_lidar_domain', default_value='0',
                 description='CycloneDDS domain id the robot publishes on'),
@@ -182,11 +188,12 @@ class Go2NodeFactory:
             DeclareLaunchArgument(
                 'raw_lidar_stamp', default_value='raw',
                 description="Header stamp basis: 'raw', 'raw_header' or 'receive'"),
-            # FOV mask over the raw cloud, for cross-robot comparison. Off by
-            # default and purely additive: it publishes a second topic and
-            # leaves the unmasked feed alone.
+            # FOV mask over the raw cloud. On by default so the processed feed
+            # is available without extra arguments; still purely additive, since
+            # it publishes its own topic and leaves the unmasked feed alone.
+            # Requires raw_lidar, which supplies its input.
             DeclareLaunchArgument(
-                'fov_mask', default_value='false',
+                'fov_mask', default_value='true',
                 description='Mask the raw cloud down to a configurable region so it '
                             'is comparable with another robot (requires raw_lidar)'),
             DeclareLaunchArgument(
@@ -370,7 +377,7 @@ class Go2NodeFactory:
         Purely additive: the driver's existing WebRTC point_cloud2 topic is
         untouched, and nothing here runs unless raw_lidar:=true.
         """
-        with_raw_lidar = LaunchConfiguration('raw_lidar', default='false')
+        with_raw_lidar = LaunchConfiguration('raw_lidar', default='true')
 
         # Empty frame means "derive from tf_prefix", so the cloud lands in the
         # same tree the rest of this launch file builds.
@@ -422,7 +429,7 @@ class Go2NodeFactory:
         one topic carries per-scan masked clouds, or the accumulated history
         when fov_mask_decay is set. Nothing runs unless fov_mask:=true.
         """
-        with_fov_mask = LaunchConfiguration('fov_mask', default='false')
+        with_fov_mask = LaunchConfiguration('fov_mask', default='true')
 
         params_file = LaunchConfiguration('fov_mask_params').perform(context)
         if not params_file:

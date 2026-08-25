@@ -286,10 +286,17 @@ front-ends like KISS-ICP and cslam's FPFH→TEASER need — `raw_lidar_node`
 subscribes to the robot's `rt/utlidar/cloud` DDS topic directly over the cabled
 link and republishes it as `sensor_msgs/PointCloud2`.
 
-It is additive and off by default; `/go2/point_cloud2` is unaffected.
+It is additive and **on by default**; `/go2/point_cloud2` is unaffected. The
+interface defaults to the Jetson's onboard NIC.
 
 ```shell
-ros2 launch go2_robot_sdk robot.launch.py raw_lidar:=true raw_lidar_iface:=eth0
+ros2 launch go2_robot_sdk robot.launch.py
+```
+
+On another host, or to disable:
+
+```shell
+ros2 launch go2_robot_sdk robot.launch.py raw_lidar_iface:=eth0 raw_lidar:=false
 ```
 
 Standalone:
@@ -306,7 +313,8 @@ layout, timestamping rationale and CycloneDDS troubleshooting, are in
 [`docs/RAW_LIDAR.md`](docs/RAW_LIDAR.md).
 
 To reduce that feed to a band comparable with another robot's lidar — for
-multi-robot SLAM across differently-mounted sensors — add `fov_mask:=true`. It
+multi-robot SLAM across differently-mounted sensors — the `fov_mask` node runs
+by default (`fov_mask:=false` to disable). It
 masks by z, range, elevation and azimuth in a gravity-aligned frame, blanks a
 sphere around the sensor to drop returns off its own mount, optionally
 accumulates points over time like RViz2's Decay Time, and reports
