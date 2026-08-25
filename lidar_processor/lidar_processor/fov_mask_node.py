@@ -70,7 +70,15 @@ class FovMaskNode(Node):
         self._read_parameters()
 
         self.tf_buffer = Buffer()
-        self.tf_listener = TransformListener(self.tf_buffer, self)
+        # spin_thread=True is not optional here. Without it the listener's /tf
+        # subscription is serviced by the same single-threaded executor that
+        # runs _on_cloud -- which then blocks inside lookup_transform waiting
+        # for a transform that can only arrive if that executor is free to
+        # process it. The buffer falls further behind on every cloud, and the
+        # lookups fail with "only time T is in the buffer" for a T that keeps
+        # receding. An all-static chain still resolves, because static
+        # transforms are valid at any time, so the symptom looks selective.
+        self.tf_listener = TransformListener(self.tf_buffer, self, spin_thread=True)
 
         # BEST_EFFORT on both sides: it is what both robots' lidar drivers
         # publish, and a reliable subscription would silently receive nothing.
@@ -399,12 +407,18 @@ class FovMaskNode(Node):
             tf = self.tf_buffer.lookup_transform(
                 target, source, Time.from_msg(header.stamp),
                 timeout=Duration(seconds=self.tf_timeout))
-        except TransformException:
+        except TransformException as exact_exc:
+            # Why the exact-stamp lookup failed is the single most diagnostic
+            # fact available here, and discarding it turns every cause --
+            # extrapolation, a missing edge, a cache that does not reach back
+            # far enough -- into the same opaque warning.
+            reason = f"{type(exact_exc).__name__}: {exact_exc}"
             if not self.tf_allow_stale:
                 self._tf_stale += 1
                 self.get_logger().warn(
                     f"No TF {target} <- {source} at the cloud stamp; dropping the "
-                    f"cloud (tf_allow_stale is false)", throttle_duration_sec=10.0)
+                    f"cloud (tf_allow_stale is false). {reason}",
+                    throttle_duration_sec=10.0)
                 return None
             try:
                 tf = self.tf_buffer.lookup_transform(target, source, Time())
@@ -422,10 +436,10 @@ class FovMaskNode(Node):
                     - Time.from_msg(tf.header.stamp).nanoseconds) * 1e-9
             self._tf_skew_last = skew
             self.get_logger().warn(
-                f"No TF {target} <- {source} at the cloud stamp; falling back to "
-                f"one {skew:+.3f} s away. A large, steady skew means the cloud and "
-                f"the transform are stamped from different clocks -- check "
-                f"stamp_source on the lidar driver against what stamps odom.",
+                f"No TF {target} <- {source} at cloud stamp "
+                f"{Time.from_msg(header.stamp).nanoseconds * 1e-9:.3f}; fell back to "
+                f"one stamped {Time.from_msg(tf.header.stamp).nanoseconds * 1e-9:.3f} "
+                f"({skew:+.3f} s away). Reason: {reason}",
                 throttle_duration_sec=5.0)
 
         t = tf.transform.translation
@@ -638,11 +652,6 @@ class FovMaskNode(Node):
             self._decay_points = 0
         self._decay_layout = layout
 
-        transform = self._lookup_transform(self.decay_frame, msg.header)
-        if transform is None:
-            return
-        rotation, translation = transform
-
         rows = np.frombuffer(payload, dtype=np.uint8).reshape(n_points, point_step)
         kept = rows[keep].copy()
 
@@ -662,7 +671,13 @@ class FovMaskNode(Node):
 
             if decayed is None:
                 # One transform for the whole sweep. Leaves intra-sweep smear
-                # in, which is what deskewing exists to remove.
+                # in, which is what deskewing exists to remove. Looked up
+                # lazily: when deskewing succeeds this is dead weight, and
+                # every TF lookup is a potential block.
+                transform = self._lookup_transform(self.decay_frame, msg.header)
+                if transform is None:
+                    return
+                rotation, translation = transform
                 decayed = xyz_kept @ rotation.T + translation
 
             writable = kept.view(xyz_dtype).reshape(-1)
