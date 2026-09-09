@@ -1,0 +1,90 @@
+# External Unitree L2 driver parameters (unitree_lidar_ros2).
+#
+# This is the lidar BOLTED ONTO the robot, reached over serial or UDP through
+# unilidar_sdk2 -- not the Go2's factory-mounted utlidar, which arrives over
+# CycloneDDS through go2_robot_sdk's raw_lidar_node. The two are independent and
+# both can run at once; see docs/EXTERNAL_LIDAR.md.
+#
+# Values here mirror the rover's swarm_slam.launch.py, which passes the same set
+# inline. Keeping them in a yaml instead means they can be retuned against a
+# live sensor with --params-file without editing a launch file.
+#
+# The frame ids and topic names are DELIBERATELY absent from this file: their
+# values carry the robot's tf_prefix, so robot.launch.py derives them
+# (<tf_prefix>/unilidar_lidar, <tf_prefix>/unilidar_imu) and passes them as
+# direct overrides. Setting them here would either hardcode one robot's prefix
+# or, unprefixed, drop the cloud outside the TF tree the rest of the stack
+# builds.
+#
+# Keyed '/**' on purpose. A key of 'unitree_lidar_ros2_node:' would never match,
+# because PushRosNamespace makes the node /go2/unitree_lidar_ros2_node -- the
+# same bare-key/FQN mismatch recorded as bugs #6 and #8 in
+# docs/SWARM_SLAM_FINDINGS.md, which silently disabled nav2's and the EKF's
+# params for a long time before anyone noticed.
+#
+# range_min and range_max are DOUBLES. Write the decimal point:
+# `range_max: 30.0`, never `range_max: 30`. YAML reads a bare 30 as an integer,
+# rclcpp refuses to coerce it, and the node dies at startup. Everything else
+# here is an int, a bool or a string.
+/**:
+  ros__parameters:
+
+    # -- transport ------------------------------------------------------------
+    # The SDK's own initialize_type: 1 = serial over USB CDC, 2 = UDP over
+    # ethernet. Anything else makes the vendor code print a message and call
+    # exit(0), so a typo here looks like the node "starting and vanishing".
+    #
+    # 2 (UDP) matches the rover. Override per host with the launch file's
+    # unilidar_conn:=serial argument rather than editing this, since which
+    # transport is wired up is a property of the robot, not of the sensor.
+    initialize_type: 2
+
+    # Work mode written to the sensor at startup. The rover runs 4, which is
+    # also what this stack wants: it suppresses the IMU data packets, and with
+    # them the driver's own TF broadcast of
+    # unilidar_imu_initial -> unilidar_imu -> unilidar_lidar. That broadcast
+    # would compete with the static mount transform robot.launch.py publishes
+    # for unilidar_lidar -- two publishers claiming one child frame, which has
+    # broken TF lookups in this stack before. The vendor default is 0.
+    work_mode: 4
+
+    # Stamp clouds from this host's clock rather than the sensor's. The sensor
+    # has no way to be disciplined against the machine running SLAM, and a
+    # standing clock offset makes every TF lookup miss -- the failure mode
+    # fov_mask reports as a large, steady `TF stale ... skew`.
+    use_system_timestamp: true
+
+    # -- serial transport (initialize_type: 1) --------------------------------
+    # /dev/ttyACM0 is the L2's USB CDC device. It is not stable across reboots
+    # or replugs if anything else on the robot also enumerates as ttyACM -- see
+    # the udev rule in docs/EXTERNAL_LIDAR.md for a fixed /dev/unilidar symlink.
+    serial_port: /dev/ttyACM0
+    baudrate: 4000000
+
+    # -- UDP transport (initialize_type: 2) -----------------------------------
+    # lidar_ip is the SENSOR's address and 192.168.1.62 is its factory default;
+    # local_ip is THIS HOST's address on that subnet, which the host must
+    # actually hold or the socket bind fails. Note the sense of these two is
+    # swapped relative to the driver's own declare_parameter defaults, which
+    # have them backwards.
+    #
+    # 192.168.1.x is chosen to stay clear of the Go2's own 192.168.123.x
+    # subnet, which raw_lidar_node's CycloneDDS link uses.
+    lidar_ip: 192.168.1.62
+    lidar_port: 6101
+    local_ip: 192.168.1.2
+    local_port: 6201
+
+    # -- scan shaping ---------------------------------------------------------
+    # Vendor default; controls how the SDK groups packets into a published
+    # sweep. Changing it changes what one message means, so leave it matching
+    # the rover -- accumulation and deskew are both reasoned about per sweep.
+    cloud_scan_num: 18
+
+    # Range clip applied in the SDK, before anything reaches ROS. 30 m is the
+    # L2 spec. Leave the far clip wide here and shape the usable band in
+    # fov_mask instead (config/fov_mask.yaml's max_range), which is the file
+    # shared with the other robot -- clipping in the driver would be invisible
+    # to that shared contract.
+    range_min: 0.0
+    range_max: 30.0

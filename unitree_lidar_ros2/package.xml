@@ -1,0 +1,33 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <name>unitree_lidar_ros2</name>
+  <version>0.0.0</version>
+  <description>ROS 2 driver for an externally mounted Unitree L2 lidar, talking
+  to the sensor directly over serial or UDP through unilidar_sdk2. Ported from
+  the rover stack so both robots run the same driver, the same topic names and
+  the same parameter contract. Independent of the Go2's own factory-mounted
+  utlidar, which reaches this stack over CycloneDDS via
+  go2_robot_sdk's raw_lidar_node instead.</description>
+  <maintainer email="lukelbmeng@gmail.com">jo</maintainer>
+  <license>GPLv3</license>
+
+  <buildtool_depend>ament_cmake</buildtool_depend>
+
+  <test_depend>ament_lint_auto</test_depend>
+  <test_depend>ament_lint_common</test_depend>
+
+  <depend>rclcpp</depend>
+  <depend>std_msgs</depend>
+  <depend>sensor_msgs</depend>
+
+  <depend>pcl_conversions</depend>
+  <depend>pcl</depend>
+
+  <depend>geometry_msgs</depend>
+  <depend>tf2_ros</depend>
+
+  <export>
+    <build_type>ament_cmake</build_type>
+  </export>
+</package>

@@ -24,9 +24,50 @@ _FRAME_PARAM_KEYS = frozenset({
 })
 
 
+# Which of the two lidars `lidar_source` selects, as (internal, external).
+#
+# The robot has one NIC and one head connector, so in practice the internal
+# utlidar and an externally mounted L2 compete for the same hardware and the
+# choice is exclusive -- hence one argument that names the intent, rather than
+# two booleans the caller has to remember to keep consistent. 'both' is kept
+# because it is the configuration in which the two feeds can be compared
+# side by side, which is what FOV_MASK.md's tuning loop asks for.
+_LIDAR_SOURCES = {
+    'internal': (True, False),
+    'external': (False, True),
+    'both': (True, True),
+    'none': (False, False),
+}
+
+# launch's own truthy set, so `raw_lidar:=1` and `raw_lidar:=True` behave here
+# the way they do in an IfCondition.
+_TRUE_VALUES = frozenset({'true', '1', 'yes', 'on'})
+_FALSE_VALUES = frozenset({'false', '0', 'no', 'off'})
+
+
 def prefix_frame(tf_prefix: str, frame: str) -> str:
     """Namespace a frame id: '' -> 'base_link', 'go2' -> 'go2/base_link'."""
     return f'{tf_prefix}/{frame}' if tf_prefix else frame
+
+
+def parse_bool(arg: str, value: str, default: bool = None) -> bool:
+    """Parse a launch argument as a bool, with '' meaning "use the default".
+
+    The tri-state matters: raw_lidar and unilidar have to distinguish "the
+    caller said nothing, so derive it from lidar_source" from "the caller said
+    false", and an IfCondition cannot express that.
+    """
+    text = value.strip().lower()
+    if not text:
+        if default is None:
+            raise RuntimeError(f'{arg} requires a value')
+        return default
+    if text in _TRUE_VALUES:
+        return True
+    if text in _FALSE_VALUES:
+        return False
+    raise RuntimeError(
+        f"{arg} must be true or false (or '' to derive it), got '{value}'")
 
 
 def rewrite_frame_params(params_path: str, tf_prefix: str) -> str:
@@ -128,6 +169,7 @@ class Go2LaunchConfig:
             'twist_mux': os.path.join(self.package_dir, 'config', 'twist_mux.yaml'),
             'slam': os.path.join(self.package_dir, 'config', 'mapper_params_online_async.yaml'),
             'nav2': os.path.join(self.package_dir, 'config', 'nav2_params.yaml'),
+            'unilidar': os.path.join(self.package_dir, 'config', 'unilidar.yaml'),
             'rviz': os.path.join(self.package_dir, 'config', self.rviz_config),
             'urdf': os.path.join(self.package_dir, 'urdf', self.urdf_file),
         }
@@ -138,6 +180,9 @@ class Go2NodeFactory:
 
     def __init__(self, config: Go2LaunchConfig):
         self.config = config
+        # Memoised so the selection is resolved -- and reported -- once, even
+        # though four node factories ask for it.
+        self._lidar_flags = None
 
     @staticmethod
     def create_launch_arguments() -> List[DeclareLaunchArgument]:
@@ -156,14 +201,33 @@ class Go2NodeFactory:
                 'tf_prefix', default_value='go2',
                 description='Prefix applied to every TF frame this robot publishes, '
                             'e.g. "go2" yields go2/odom -> go2/base_link'),
-            # Raw lidar over CycloneDDS/Ethernet. On by default: it is the feed
-            # the SLAM stack actually consumes. Still additive -- the driver's
-            # WebRTC point_cloud2 is unaffected. Needs unitree_sdk2py and a
-            # cabled link on the robot's subnet; without them the node logs the
-            # failure and exits, leaving the rest of the stack running.
+            # Which lidar feeds this stack. One switch rather than two
+            # booleans because the choice is effectively exclusive: the robot
+            # has one NIC and one head connector, so an externally mounted L2
+            # generally means the internal utlidar is unplugged or unreachable.
+            #
+            # 'internal' is the default, which is exactly today's behaviour --
+            # raw_lidar on, unilidar off.
             DeclareLaunchArgument(
-                'raw_lidar', default_value='true',
-                description='Publish the raw rt/utlidar/cloud feed over CycloneDDS'),
+                'lidar_source', default_value='internal',
+                choices=list(_LIDAR_SOURCES),
+                description="Which lidar to run: 'internal' (the factory "
+                            "utlidar over CycloneDDS), 'external' (an L2 bolted "
+                            "on, over serial/UDP), 'both' (for comparing the two "
+                            "feeds side by side) or 'none'. Each feed's own "
+                            'fov_mask instance follows it, so nothing is left '
+                            'subscribing to a topic no one publishes'),
+            # Raw lidar over CycloneDDS/Ethernet. Empty derives from
+            # lidar_source; pass true/false to override that for this feed
+            # alone. Additive either way -- the driver's WebRTC point_cloud2 is
+            # unaffected. Needs unitree_sdk2py and a cabled link on the robot's
+            # subnet; without them the node logs the failure and exits, leaving
+            # the rest of the stack running.
+            DeclareLaunchArgument(
+                'raw_lidar', default_value='',
+                description='Publish the raw rt/utlidar/cloud feed over '
+                            "CycloneDDS. Empty follows lidar_source (on for "
+                            "'internal' and 'both'); true/false overrides it"),
             DeclareLaunchArgument(
                 'raw_lidar_iface',
                 default_value=os.getenv('GO2_LIDAR_IFACE', 'enP8p1s0'),
@@ -191,11 +255,14 @@ class Go2NodeFactory:
             # FOV mask over the raw cloud. On by default so the processed feed
             # is available without extra arguments; still purely additive, since
             # it publishes its own topic and leaves the unmasked feed alone.
-            # Requires raw_lidar, which supplies its input.
+            # Its input comes from raw_lidar, so it is skipped outright when
+            # that feed is off rather than left warning about a topic nobody
+            # publishes.
             DeclareLaunchArgument(
                 'fov_mask', default_value='true',
                 description='Mask the raw cloud down to a configurable region so it '
-                            'is comparable with another robot (requires raw_lidar)'),
+                            'is comparable with another robot. Ignored unless the '
+                            'internal feed is running'),
             DeclareLaunchArgument(
                 'fov_mask_params', default_value='',
                 description='Path to a mask yaml. Empty uses config/fov_mask.yaml. '
@@ -222,6 +289,98 @@ class Go2NodeFactory:
                 description='Frame the accumulation happens in. Empty derives '
                             '<tf_prefix>/odom. Must be fixed with respect to the '
                             'world -- never base_link or base_footprint'),
+            # ---------------------------------------------------------------
+            # Externally mounted Unitree L2, driven directly over serial or UDP
+            # by unitree_lidar_ros2 (unilidar_sdk2). This is a SECOND, entirely
+            # separate sensor from the robot's factory-mounted utlidar that
+            # raw_lidar above reads over CycloneDDS -- both can run at once and
+            # neither touches the other's topics or frames.
+            #
+            # Off unless lidar_source asks for it. The vendor driver responds
+            # to a missing sensor by calling exit(0) or blocking on a socket
+            # bind rather than logging and carrying on, so this is not a feed
+            # to leave enabled speculatively on a robot that may not have the
+            # hardware bolted on.
+            DeclareLaunchArgument(
+                'unilidar', default_value='',
+                description='Start the external Unitree L2 driver '
+                            '(unitree_lidar_ros2) and publish its mount '
+                            "transform. Empty follows lidar_source (on for "
+                            "'external' and 'both'); true/false overrides it"),
+            DeclareLaunchArgument(
+                'unilidar_params', default_value='',
+                description='Path to the driver yaml. Empty uses '
+                            'config/unilidar.yaml'),
+            # Which transport is wired up is a property of this robot, not of
+            # the sensor, so it is an argument rather than a yaml edit.
+            DeclareLaunchArgument(
+                'unilidar_conn', default_value='',
+                description="Transport: 'serial' (USB CDC) or 'udp' (ethernet). "
+                            "Empty keeps the yaml's initialize_type"),
+            DeclareLaunchArgument(
+                'unilidar_serial_port', default_value='',
+                description="Serial device for unilidar_conn:=serial. Empty keeps "
+                            "the yaml's /dev/ttyACM0. Prefer a udev symlink such as "
+                            '/dev/unilidar -- ttyACM numbering is not stable'),
+            DeclareLaunchArgument(
+                'unilidar_ip', default_value='',
+                description="The sensor's own address for unilidar_conn:=udp. "
+                            "Empty keeps the yaml's 192.168.1.62"),
+            DeclareLaunchArgument(
+                'unilidar_local_ip', default_value='',
+                description="This host's address on the lidar subnet. Empty keeps "
+                            "the yaml's 192.168.1.2. The host must actually hold "
+                            'this address or the UDP bind fails'),
+            DeclareLaunchArgument(
+                'unilidar_topic', default_value='unilidar/cloud',
+                description='Topic for the external cloud; the IMU topic follows '
+                            'it. Relative resolves under this stack\'s /go2 '
+                            "namespace, matching the rover's "
+                            '/<robot>/unilidar/cloud. Pass an absolute name such '
+                            'as /r0/unilidar/cloud to feed a Swarm-SLAM robot '
+                            'namespace directly'),
+            DeclareLaunchArgument(
+                'unilidar_frame', default_value='',
+                description='frame_id for the external cloud. Empty derives '
+                            '<tf_prefix>/unilidar_lidar, which the mount transform '
+                            'below supplies'),
+            # The mount geometry is the one thing here that cannot have a
+            # correct default: it describes where this particular sensor is
+            # bolted. Measure it. Everything downstream -- the shared z band,
+            # the range band, cross-robot registration -- is expressed in a
+            # gravity-aligned frame reached through this transform, so an
+            # unmeasured mount silently invalidates all of it.
+            DeclareLaunchArgument(
+                'unilidar_mount_xyz', default_value='0.0 0.0 0.15',
+                description='Sensor origin as "x y z" metres in <tf_prefix>/'
+                            'base_link. MEASURE THIS -- the default is a placeholder '
+                            'for a plate on the robot\'s back, not a calibration'),
+            DeclareLaunchArgument(
+                'unilidar_mount_ypr', default_value='0.0 0.0 0.0',
+                description='Sensor orientation as "yaw pitch roll" radians, the '
+                            'order static_transform_publisher takes positionally. '
+                            'All zeros means upright and facing forward, which is '
+                            "the point of mounting it externally -- the Go2's "
+                            'factory lidar is the inverted one'),
+            DeclareLaunchArgument(
+                'unilidar_fov_mask', default_value='false',
+                description='Run a fov_mask instance over the external cloud, '
+                            'publishing <unilidar_topic>_processed. Off by '
+                            'default: with the L2 mounted upright on top of both '
+                            'robots, the two sensors already observe the same '
+                            'part of the world and there is no band to select. '
+                            'Turn it on to reduce both feeds to a shared region, '
+                            'or to accumulate sweeps (fov_mask_decay) -- the same '
+                            'node does both. Shares the fov_mask_* arguments '
+                            'above, since the band is what both robots hold in '
+                            'common. Ignored unless the external feed is running'),
+            DeclareLaunchArgument(
+                'unilidar_fov_mask_blank_radius', default_value='',
+                description="Override sensor_blank_radius for the external feed "
+                            'only. Separate from the shared yaml on purpose: this '
+                            "value describes mount hardware, and the external "
+                            "mount is not the factory head mount. Empty keeps the "
+                            "yaml's value"),
         ]
 
     def create_robot_state_nodes(self) -> List[Node]:
@@ -371,13 +530,58 @@ class Go2NodeFactory:
             ),
         ]
 
+    def lidar_flags(self, context) -> tuple:
+        """Resolve which lidar feeds run, as (internal, external) booleans.
+
+        lidar_source names the intent; raw_lidar and unilidar override it per
+        feed when they are given a value. The tri-state is what makes that
+        work: '' means "follow lidar_source", which is different from false and
+        cannot be expressed as an IfCondition -- so the gating for both feeds
+        is resolved here in Python and the node lists come back empty rather
+        than carrying a condition.
+
+        Resolving it rather than deferring to IfCondition also means the
+        fov_mask instances can be skipped when their input feed is off. A mask
+        node with no publisher on cloud_in does not fail; it sits there warning
+        that it has processed 0 clouds, which reads like a bug in the mask.
+        """
+        if self._lidar_flags is not None:
+            return self._lidar_flags
+
+        source = LaunchConfiguration('lidar_source').perform(context).strip().lower()
+        if source not in _LIDAR_SOURCES:
+            raise RuntimeError(
+                f"lidar_source must be one of {sorted(_LIDAR_SOURCES)}, "
+                f"got '{source}'")
+        internal_default, external_default = _LIDAR_SOURCES[source]
+
+        internal = parse_bool(
+            'raw_lidar',
+            LaunchConfiguration('raw_lidar').perform(context),
+            internal_default)
+        external = parse_bool(
+            'unilidar',
+            LaunchConfiguration('unilidar').perform(context),
+            external_default)
+
+        selected = [name for name, on in
+                    (('internal utlidar', internal), ('external L2', external)) if on]
+        print(f"   Lidar: {', '.join(selected) or '<none>'} "
+              f"(lidar_source:={source})")
+
+        self._lidar_flags = (internal, external)
+        return self._lidar_flags
+
     def create_raw_lidar_nodes(self, context) -> List[Node]:
         """Create the raw lidar node (CycloneDDS over Ethernet).
 
         Purely additive: the driver's existing WebRTC point_cloud2 topic is
-        untouched, and nothing here runs unless raw_lidar:=true.
+        untouched, and nothing here runs unless the internal feed is selected
+        (lidar_source:=internal|both, or raw_lidar:=true outright).
         """
-        with_raw_lidar = LaunchConfiguration('raw_lidar', default='true')
+        internal, _ = self.lidar_flags(context)
+        if not internal:
+            return []
 
         # Empty frame means "derive from tf_prefix", so the cloud lands in the
         # same tree the rest of this launch file builds.
@@ -397,7 +601,6 @@ class Go2NodeFactory:
                 executable='raw_lidar_node',
                 name='raw_lidar_node',
                 output='screen',
-                condition=IfCondition(with_raw_lidar),
                 parameters=[{
                     'network_interface': LaunchConfiguration('raw_lidar_iface'),
                     'dds_domain_id': domain_id,
@@ -411,7 +614,6 @@ class Go2NodeFactory:
                 executable='static_transform_publisher',
                 name='lidar_static_tf',
                 output='screen',
-                condition=IfCondition(with_raw_lidar),
                 # x y z yaw pitch roll parent_frame child_frame
                 arguments=[
                            '0.28945', '0', '0.45', # offset from base_link (adjust to match physical mount)
@@ -421,16 +623,18 @@ class Go2NodeFactory:
             ),
         ]
 
-    def create_fov_mask_nodes(self, context) -> List[Node]:
-        """Create the FOV mask node over the raw cloud.
+    def _fov_mask_config(self, context) -> tuple:
+        """Resolve the shared mask yaml and the per-robot overrides on top of it.
 
-        Additive: publishes <raw_lidar_topic>_processed and leaves the
-        unmasked feed untouched, so the two can be compared side by side. That
-        one topic carries per-scan masked clouds, or the accumulated history
-        when fov_mask_decay is set. Nothing runs unless fov_mask:=true.
+        Both fov_mask instances -- the one over the factory utlidar and the one
+        over the external L2 -- read the SAME yaml and the SAME fov_mask_*
+        arguments. That is deliberate and is the whole point of the file: the
+        band is what the two ROBOTS have to hold in common, so it cannot be
+        specialised per feed without breaking the comparison it exists to make.
+
+        Only the values that carry a tf_prefix are overridden here, since a
+        yaml shared with another robot cannot name this robot's frames.
         """
-        with_fov_mask = LaunchConfiguration('fov_mask', default='true')
-
         params_file = LaunchConfiguration('fov_mask_params').perform(context)
         if not params_file:
             params_file = os.path.join(self.config.package_dir, 'config', 'fov_mask.yaml')
@@ -438,8 +642,6 @@ class Go2NodeFactory:
         mask_frame = LaunchConfiguration('fov_mask_frame').perform(context)
         if not mask_frame:
             mask_frame = self.config.frame('base_footprint')
-
-        raw_topic = LaunchConfiguration('raw_lidar_topic').perform(context)
 
         # Direct overrides: these carry each robot's tf_prefix, so they cannot
         # live in a yaml meant to be shared between robots. Empty means the
@@ -460,17 +662,229 @@ class Go2NodeFactory:
         if decay_time:
             overrides['decay_time'] = float(decay_time)
 
+        return params_file, overrides
+
+    def create_fov_mask_nodes(self, context) -> List[Node]:
+        """Create the FOV mask node over the raw cloud.
+
+        Additive: publishes <raw_lidar_topic>_processed and leaves the
+        unmasked feed untouched, so the two can be compared side by side. That
+        one topic carries per-scan masked clouds, or the accumulated history
+        when fov_mask_decay is set.
+
+        Skipped entirely when the internal feed is off, not merely when
+        fov_mask:=false -- its input is that feed, and a mask node with no
+        publisher on cloud_in sits there reporting 0 clouds processed, which
+        reads like a fault in the mask rather than an absent sensor.
+        """
+        internal, _ = self.lidar_flags(context)
+        if not internal or not parse_bool(
+                'fov_mask', LaunchConfiguration('fov_mask').perform(context)):
+            return []
+
+        params_file, overrides = self._fov_mask_config(context)
+        raw_topic = LaunchConfiguration('raw_lidar_topic').perform(context)
+
         return [
             Node(
                 package='lidar_processor',
                 executable='fov_mask',
                 name='fov_mask_node',
                 output='screen',
-                condition=IfCondition(with_fov_mask),
                 parameters=[params_file, overrides],
                 remappings=[
                     ('cloud_in', raw_topic),
                     ('cloud_processed', f'{raw_topic}_processed'),
+                ],
+            ),
+        ]
+
+    def create_unilidar_nodes(self, context) -> List[Node]:
+        """Create the external Unitree L2 driver and its mount transform.
+
+        Mirrors the rover's swarm_slam.launch.py: the same driver package, the
+        same unilidar/cloud topic, the same <prefix>/unilidar_lidar frame, and a
+        static transform placing that frame on the body. Both robots therefore
+        present an upright external L2 the same way, which is what lets one
+        shared mask yaml describe both.
+
+        Additive: the factory utlidar feed that raw_lidar_node publishes is
+        untouched, and nothing here runs unless the external feed is selected
+        (lidar_source:=external|both, or unilidar:=true outright).
+
+        This node publishes NO TF of its own in work_mode 4 -- the mount
+        transform below is the sole authority on <prefix>/unilidar_lidar. In
+        other work modes the vendor driver broadcasts
+        unilidar_imu_initial -> unilidar_imu -> unilidar_lidar from its IMU
+        callback, which would make two publishers claim that child frame. That
+        exact competing-authority shape has broken TF lookups in this stack
+        before, so the work mode is not an incidental setting.
+        """
+        _, external = self.lidar_flags(context)
+        if not external:
+            return []
+
+        params_file = LaunchConfiguration('unilidar_params').perform(context)
+        if not params_file:
+            params_file = self.config.config_paths['unilidar']
+
+        # Empty frame means "derive from tf_prefix", so the cloud lands in the
+        # same tree the rest of this launch file builds. Bare, unprefixed frame
+        # ids have broken TF lookups here repeatedly.
+        cloud_frame = LaunchConfiguration('unilidar_frame').perform(context)
+        if not cloud_frame:
+            cloud_frame = self.config.frame('unilidar_lidar')
+
+        cloud_topic = LaunchConfiguration('unilidar_topic').perform(context)
+
+        # The IMU topic sits alongside the cloud, so retuning unilidar_topic
+        # moves both together rather than leaving the IMU behind on a stale
+        # name. 'unilidar/cloud' -> 'unilidar/imu'; a bare 'cloud' -> 'imu'.
+        imu_topic = (cloud_topic.rsplit('/', 1)[0] + '/imu') if '/' in cloud_topic else 'imu'
+
+        # The frame ids and topic names are always overridden, never left to the
+        # yaml: their values carry this robot's tf_prefix. The IMU frame gets a
+        # prefix too even though nothing consumes it in work_mode 4, so that
+        # turning the IMU on later does not inject an unprefixed frame.
+        overrides = {
+            'cloud_frame': cloud_frame,
+            'cloud_topic': cloud_topic,
+            'imu_frame': self.config.frame('unilidar_imu'),
+            'imu_topic': imu_topic,
+        }
+
+        # 'serial' / 'udp' rather than the SDK's bare 1 / 2, because a wrong
+        # initialize_type makes the vendor code print one line and call
+        # exit(0) -- which reads as the node starting and vanishing.
+        conn = LaunchConfiguration('unilidar_conn').perform(context).strip().lower()
+        if conn:
+            if conn not in ('serial', 'udp'):
+                raise RuntimeError(
+                    f"unilidar_conn must be 'serial' or 'udp', got '{conn}'")
+            overrides['initialize_type'] = 1 if conn == 'serial' else 2
+
+        serial_port = LaunchConfiguration('unilidar_serial_port').perform(context)
+        if serial_port:
+            overrides['serial_port'] = serial_port
+
+        lidar_ip = LaunchConfiguration('unilidar_ip').perform(context)
+        if lidar_ip:
+            overrides['lidar_ip'] = lidar_ip
+
+        local_ip = LaunchConfiguration('unilidar_local_ip').perform(context)
+        if local_ip:
+            overrides['local_ip'] = local_ip
+
+        # static_transform_publisher takes these positionally as
+        # x y z yaw pitch roll, and passing the wrong count is a classic
+        # missing-comma bug in this repo's launch files -- so they are parsed
+        # and checked here rather than splatted straight into arguments, where
+        # a miscount silently shifts the parent and child frame ids along.
+        def mount(arg: str, labels: str) -> List[str]:
+            fields = LaunchConfiguration(arg).perform(context).split()
+            if len(fields) != 3:
+                raise RuntimeError(
+                    f'{arg} must be three numbers "{labels}", got '
+                    f'{len(fields)}: {fields}')
+            try:
+                return [str(float(field)) for field in fields]
+            except ValueError as exc:
+                raise RuntimeError(f'{arg} is not numeric: {fields}') from exc
+
+        mount_xyz = mount('unilidar_mount_xyz', 'x y z')
+        mount_ypr = mount('unilidar_mount_ypr', 'yaw pitch roll')
+
+        return [
+            Node(
+                package='unitree_lidar_ros2',
+                executable='unitree_lidar_ros2_node',
+                name='unitree_lidar_ros2_node',
+                output='screen',
+                parameters=[params_file, overrides],
+            ),
+            Node(
+                package='tf2_ros',
+                executable='static_transform_publisher',
+                name='unilidar_static_tf',
+                output='screen',
+                # x y z yaw pitch roll parent_frame child_frame
+                #
+                # Parented to base_link rather than base_footprint because that
+                # is where the sensor is physically bolted. On this robot the
+                # two are coincident anyway -- go2.urdf leaves
+                # base_footprint_joint at zero deliberately, so base_footprint
+                # is NOT ground-projected here despite the name -- but naming
+                # base_link keeps the transform meaningful if that is ever
+                # fixed.
+                arguments=[*mount_xyz, *mount_ypr,
+                           self.config.frame('base_link'),
+                           cloud_frame],
+            ),
+        ]
+
+    def create_unilidar_fov_mask_nodes(self, context) -> List[Node]:
+        """Create a second FOV mask instance over the external L2 cloud.
+
+        A separate instance rather than a switch on the existing one: the two
+        feeds are different sensors on different mounts and both are worth
+        having masked at once, which is how you compare what the factory
+        inverted mount sees against what the external upright one does.
+
+        Publishes <unilidar_topic>_processed -- so
+        /go2/unilidar/cloud_processed by default, matching the rover's
+        /<robot>/unilidar/cloud_processed. That is the topic to hand cslam:
+
+            pointcloud_topic:=unilidar/cloud_processed
+
+        Like the raw instance, skipped entirely when its input feed is off
+        rather than left subscribing to a topic nobody publishes.
+
+        Off by default, unlike the raw instance. The mask exists to reconcile
+        two differently-mounted sensors: the factory utlidar is inverted ~165
+        deg and sees mostly floor, so reducing both robots to one band is the
+        only way their clouds describe the same content. An L2 mounted upright
+        on top of both robots removes that problem at the hardware level --
+        same sensor, same attitude, no band to select -- so masking here would
+        only discard geometry. The shared yaml's sensor_blank_radius of 0.68 m,
+        sized for the rover's mast, would discard a lot of it.
+
+        Note that this node also does accumulation and deskewing, which are
+        NOT masking: the L2 is a non-repetitive scanner, so one sweep is a
+        sparse slice of the room. With the node off, consumers get per-sweep
+        clouds off unilidar/cloud. To accumulate without masking, turn it on
+        and leave the band unbounded -- every mask primitive defaults to
+        unbounded, so a fov_mask with only decay_time set is a passthrough that
+        accumulates.
+        """
+        _, external = self.lidar_flags(context)
+        if not external or not parse_bool(
+                'unilidar_fov_mask',
+                LaunchConfiguration('unilidar_fov_mask').perform(context)):
+            return []
+
+        params_file, overrides = self._fov_mask_config(context)
+
+        # sensor_blank_radius is the one mask value that is legitimately
+        # per-feed: it deletes returns off the sensor's own mount, and the
+        # external mount is not the factory head mount. Everything else stays
+        # shared -- see _fov_mask_config.
+        blank_radius = LaunchConfiguration(
+            'unilidar_fov_mask_blank_radius').perform(context)
+        if blank_radius:
+            overrides['sensor_blank_radius'] = float(blank_radius)
+
+        cloud_topic = LaunchConfiguration('unilidar_topic').perform(context)
+
+        return [
+            Node(
+                package='lidar_processor',
+                executable='fov_mask',
+                name='unilidar_fov_mask_node',
+                output='screen',
+                parameters=[params_file, overrides],
+                remappings=[
+                    ('cloud_in', cloud_topic),
+                    ('cloud_processed', f'{cloud_topic}_processed'),
                 ],
             ),
         ]
@@ -601,6 +1015,8 @@ def _launch_setup(context, *args, **kwargs):
     core_nodes = factory.create_core_nodes()
     raw_lidar_nodes = factory.create_raw_lidar_nodes(context)
     fov_mask_nodes = factory.create_fov_mask_nodes(context)
+    unilidar_nodes = factory.create_unilidar_nodes(context)
+    unilidar_fov_mask_nodes = factory.create_unilidar_fov_mask_nodes(context)
     teleop_nodes = factory.create_teleop_nodes()
     visualization_nodes = factory.create_visualization_nodes()
     include_launches = factory.create_include_launches()
@@ -612,6 +1028,8 @@ def _launch_setup(context, *args, **kwargs):
         core_nodes +
         raw_lidar_nodes +
         fov_mask_nodes +
+        unilidar_nodes +
+        unilidar_fov_mask_nodes +
         teleop_nodes +
         visualization_nodes +
         include_launches

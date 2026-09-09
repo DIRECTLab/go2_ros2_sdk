@@ -387,7 +387,7 @@ Publishes `/go2/raw_lidar_processed` alongside the untouched `/go2/raw_lidar`.
 
 | argument | default | meaning |
 |---|---|---|
-| `fov_mask` | `true` | run the node; `false` leaves it out. Requires `raw_lidar`, which supplies its input |
+| `fov_mask` | `true` | run the node; `false` leaves it out. Skipped outright when the internal feed is off, since that feed is its input |
 | `fov_mask_params` | `config/fov_mask.yaml` | path to the shared mask yaml |
 | `fov_mask_frame` | `''` | mask axes / z datum; empty derives `<tf_prefix>/base_footprint` |
 | `fov_mask_origin` | `''` | measurement origin; empty keeps the yaml's value |
@@ -407,6 +407,41 @@ To make that same topic carry 5 seconds of accumulated history instead:
 ```bash
 ros2 launch go2_robot_sdk robot.launch.py fov_mask_decay:=5.0
 ```
+
+### Over the external L2
+
+An externally mounted L2 gets its own instance of this node,
+`unilidar_fov_mask_node`, publishing `/go2/unilidar/cloud_processed`. **It is off
+by default** — with the L2 mounted upright on top of both robots the two sensors
+already observe the same part of the world, so there is no band to select and
+masking would only discard geometry:
+
+```bash
+ros2 launch go2_robot_sdk robot.launch.py lidar_source:=external unilidar_fov_mask:=true
+```
+
+Bear in mind that accumulation and deskewing live in this node too, and are not
+masking. Turning it off means per-sweep clouds — correct for scan-to-map
+odometry, and something to revisit if cslam wants denser keyframes. Every mask
+primitive defaults to unbounded, so a `fov_mask` with only `decay_time` set is a
+passthrough that accumulates.
+
+**Each instance follows its feed.** `lidar_source` decides which lidars run, and
+a mask instance whose input feed is off is not launched at all. Without that, a
+mask node with no publisher on `cloud_in` sits there reporting 0 clouds
+processed every `stats_period` seconds — which reads like a fault in the mask
+rather than an absent sensor.
+
+When it is on it reads the **same** yaml and honours the **same** `fov_mask_*`
+arguments as the raw instance above — the band is what the two robots hold in
+common, so specialising it per feed would break the comparison it exists to
+make. The one exception is `sensor_blank_radius`, which describes mount
+hardware: `unilidar_fov_mask_blank_radius` overrides it for that feed alone.
+
+Running both instances (`lidar_source:=both unilidar_fov_mask:=true`) is how you
+measure the inverted factory mount against an upright external one, which is
+what the tuning loop above asks for. See
+[`EXTERNAL_LIDAR.md`](EXTERNAL_LIDAR.md).
 
 ### Standalone, on either robot
 

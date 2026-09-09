@@ -898,7 +898,16 @@ def main(args=None):
     except KeyboardInterrupt:
         pass
     except Exception as e:
-        print(f"Error running fov mask node: {e}")
+        # Parameter type errors are the common way this node fails to start,
+        # and the shared yaml is edited on two robots, so spell out the cause.
+        # rclpy will not coerce a declared DOUBLE from a YAML integer: written
+        # bare, `max_range: 30` is an INTEGER and is rejected outright.
+        hint = ''
+        if 'expecting type' in str(e):
+            hint = ("\n  A parameter in the mask yaml has the wrong type. If it "
+                    "reads INTEGER where DOUBLE is expected, the value is missing "
+                    "its decimal point -- write 30.0, not 30.")
+        print(f"ERROR: fov mask node failed to start: {e}{hint}")
     finally:
         if node is not None:
             node.destroy_node()

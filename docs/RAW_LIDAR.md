@@ -6,7 +6,9 @@ Publishes the robot's onboard L2 lidar feed — taken straight off the
 
 This is **additive**. Nothing about the driver's existing WebRTC point cloud
 (`/go2/point_cloud2`) changes. The node is **on by default** in the launch file;
-pass `raw_lidar:=false` to leave it out.
+pass `lidar_source:=external` (or `raw_lidar:=false`) to leave it out — see
+[Choosing which lidar runs](EXTERNAL_LIDAR.md#choosing-which-lidar-runs), which
+also covers running this feed alongside an externally mounted L2.
 
 ## Why this exists rather than reusing the WebRTC path
 
@@ -215,7 +217,8 @@ Launch arguments:
 
 | argument | default | meaning |
 |---|---|---|
-| `raw_lidar` | `true` | run the node; `false` leaves it out |
+| `lidar_source` | `internal` | which lidar runs: `internal`, `external`, `both`, `none`. This feed is on for `internal` and `both` |
+| `raw_lidar` | `''` | override `lidar_source` for this feed alone; `''` follows it, `false` leaves the node out |
 | `raw_lidar_iface` | `$GO2_LIDAR_IFACE` or `enP8p1s0` | network interface, defaulting to the Jetson's |
 | `raw_lidar_domain` | `0` | DDS domain id |
 | `raw_lidar_topic` | `raw_lidar` | resolves to `/go2/raw_lidar` under this launch file's `PushRosNamespace('go2')` |
@@ -321,4 +324,4 @@ installed version's `unitree_sdk2py/idl/sensor_msgs/` tree.
 |---|---|
 | `go2_robot_sdk/infrastructure/dds/utlidar_cloud_subscriber.py` | ROS-free DDS adapter: channel factory, subscriber, message-shape helpers, confirmed layout constant |
 | `go2_robot_sdk/presentation/raw_lidar_node.py` | the `rclpy` node |
-| `launch/robot.launch.py` | `create_raw_lidar_nodes()`, on by default, disable with `raw_lidar:=false` |
+| `launch/robot.launch.py` | `create_raw_lidar_nodes()`, on by default, disable with `lidar_source:=external` or `raw_lidar:=false` |

@@ -14,6 +14,10 @@
 # PushRosNamespace makes the node /go2/fov_mask_node -- the same bare-key/FQN
 # mismatch recorded as bugs #6 and #8 in docs/SWARM_SLAM_FINDINGS.md, which cost
 # a long debug when nav2 and the EKF silently ignored their params.
+# Every value below that is a distance, angle or duration is a DOUBLE. Write
+# the decimal point: `max_range: 30.0`, never `max_range: 30`. YAML reads a bare
+# 30 as an integer, rclpy refuses to coerce it, and the node exits on startup
+# with "expecting type 'DOUBLE'".
 /**:
   ros__parameters:
 

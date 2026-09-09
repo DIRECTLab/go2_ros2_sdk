@@ -321,6 +321,38 @@ accumulates points over time like RViz2's Decay Time, and reports
 what it retained so both robots can be tuned to overlap. See
 [`docs/FOV_MASK.md`](docs/FOV_MASK.md).
 
+### External Unitree L2
+
+The factory lidar is mounted inverted (~165°) and sees mostly floor, which no
+amount of masking can fix — a flat floor is translation-degenerate. An L2
+**bolted onto the robot**, upright, is the fix, and it is the same sensor model
+the rover carries:
+
+```shell
+ros2 launch go2_robot_sdk robot.launch.py lidar_source:=external unilidar_conn:=serial
+```
+
+Publishes `/go2/unilidar/cloud` — the same topic name the rover uses, so the
+cslam bridge configuration means the same thing on both robots. With the L2
+mounted upright on top of both robots the two sensors already observe the same
+part of the world, so masking is off by default; `unilidar_fov_mask:=true` adds
+a `fov_mask` instance publishing `/go2/unilidar/cloud_processed`, which is also
+how you get sweep accumulation.
+
+`lidar_source` picks which lidar runs — `internal` (the default, today's
+behaviour), `external`, `both` for comparing the two feeds side by side, or
+`none`. The two sensors compete for the same NIC and head connector, so this is
+one switch rather than two booleans to keep consistent, and each feed's
+`fov_mask` instance follows it so nothing is left subscribing to a topic no one
+publishes. `raw_lidar` and `unilidar` still override it per feed.
+
+It needs the vendor SDK cloned (`git clone
+https://github.com/unitreerobotics/unilidar_sdk2.git ~/unilidar_sdk2`) and the
+mount geometry measured — `unilidar_mount_xyz` / `unilidar_mount_ypr` default to
+a placeholder, not a calibration. Serial vs UDP wiring, the udev rule, the
+work-mode/TF-authority constraint and how to feed the result to Swarm-SLAM are
+in [`docs/EXTERNAL_LIDAR.md`](docs/EXTERNAL_LIDAR.md).
+
 ## Foxglove
 
 <p align="center">
